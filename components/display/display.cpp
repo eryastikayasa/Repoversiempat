@@ -21,6 +21,12 @@ static bool oled_ready = false;
 static face_state_t current_face_state = FACE_IDLE;
 static EXT_RAM_BSS_ATTR uint8_t face_buffer[OLED_WIDTH * OLED_HEIGHT / 8];
 
+static char user_scroll_text[256] = {0};
+static char gemini_scroll_text[256] = {0};
+static uint16_t user_scroll_offset = 0;
+static uint16_t gemini_scroll_offset = 0;
+static portMUX_TYPE scroll_text_mux = portMUX_INITIALIZER_UNLOCKED;
+
 static void draw_buffer_locked(const uint8_t *buffer)
 {
     if (!panel || !buffer) return;
@@ -62,10 +68,10 @@ static void draw_rssi_char(int x, int y, char c)
     }
 }
 
-static void draw_rssi(void)
+static int draw_rssi(void)
 {
     wifi_ap_record_t ap_info = {};
-    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) return;
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) return 0;
 
     int rssi = ap_info.rssi;
     if (rssi > 0) rssi = 0;
@@ -82,6 +88,8 @@ static void draw_rssi(void)
         draw_rssi_char(x, y, text[i]);
         x += char_width;
     }
+
+    return x;
 }
 
 void oled_init(void)
@@ -181,8 +189,105 @@ void display_status(const char *text)
     ESP_LOGI(TAG, "[OLED STATUS]: %s", text ? text : "(null)");
 }
 
-void face_set_state(face_state_t state) { current_face_state = state; }
-face_state_t face_get_state(void) { return current_face_state; }
+static void set_scroll_text(char *dst, size_t dst_size, const char *text, uint16_t &offset)
+{
+    if (!dst || dst_size == 0) return;
+
+    dst[0] = '\0';
+    offset = 0;
+    if (!text) return;
+
+    size_t out = 0;
+    for (size_t i = 0; text[i] != '\0' && out + 1 < dst_size; ++i) {
+        unsigned char c = (unsigned char)text[i];
+        if (c >= 0x20 && c <= 0x7E)
+            dst[out++] = (char)c;
+    }
+    dst[out] = '\0';
+}
+
+static void append_scroll_text(char *dst, size_t dst_size, const char *text)
+{
+    if (!dst || dst_size == 0 || !text || !text[0]) return;
+
+    size_t out = strlen(dst);
+    if (out > 0 && out + 1 < dst_size) {
+        dst[out++] = ' ';
+        dst[out] = '\0';
+    }
+
+    for (size_t i = 0; text[i] != '\0' && out + 1 < dst_size; ++i) {
+        unsigned char c = (unsigned char)text[i];
+        if (c >= 0x20 && c <= 0x7E)
+            dst[out++] = (char)c;
+    }
+    dst[out] = '\0';
+}
+
+void display_set_user_text(const char *text)
+{
+    portENTER_CRITICAL(&scroll_text_mux);
+    set_scroll_text(user_scroll_text, sizeof(user_scroll_text), text, user_scroll_offset);
+    portEXIT_CRITICAL(&scroll_text_mux);
+}
+
+void display_set_gemini_text(const char *text)
+{
+    portENTER_CRITICAL(&scroll_text_mux);
+    set_scroll_text(gemini_scroll_text, sizeof(gemini_scroll_text), text, gemini_scroll_offset);
+    portEXIT_CRITICAL(&scroll_text_mux);
+}
+
+static void display_append_user_text(const char *text)
+{
+    portENTER_CRITICAL(&scroll_text_mux);
+    append_scroll_text(user_scroll_text, sizeof(user_scroll_text), text);
+    portEXIT_CRITICAL(&scroll_text_mux);
+}
+
+static void display_append_gemini_text(const char *text)
+{
+    portENTER_CRITICAL(&scroll_text_mux);
+    append_scroll_text(gemini_scroll_text, sizeof(gemini_scroll_text), text);
+    portEXIT_CRITICAL(&scroll_text_mux);
+}
+
+static uint8_t text_glyph_row(char c, int row)
+{
+    static const uint8_t letters[26][5] = {
+        {14,17,31,17,17}, {30,17,30,17,30}, {15,16,16,16,15},
+        {30,17,17,17,30}, {31,16,30,16,31}, {31,16,30,16,16},
+        {15,16,23,17,15}, {17,17,31,17,17}, {31,4,4,4,31},
+        {7,2,2,18,12}, {17,18,28,18,17}, {16,16,16,16,31},
+        {17,27,21,17,17}, {17,25,21,19,17}, {14,17,17,17,14},
+        {30,17,30,16,16}, {14,17,21,19,15}, {30,17,30,18,17},
+        {15,16,14,1,30}, {31,4,4,4,4}, {17,17,17,17,14},
+        {17,17,17,10,4}, {17,17,21,27,17}, {17,10,4,10,17},
+        {17,10,4,4,4}, {31,2,4,8,31}
+    };
+    static const uint8_t digits[10][5] = {
+        {14,17,19,21,14}, {4,12,4,4,14}, {14,1,6,8,31},
+        {30,1,6,1,30}, {18,18,31,2,2}, {31,16,30,1,30},
+        {14,16,30,17,14}, {31,1,2,4,4}, {14,17,14,17,14},
+        {14,17,15,1,14}
+    };
+
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    if (c >= 'A' && c <= 'Z') return letters[c - 'A'][row];
+    if (c >= '0' && c <= '9') return digits[c - '0'][row];
+
+    switch (c) {
+        case '-': return row == 2 ? 14 : 0;
+        case '.': return row == 4 ? 4 : 0;
+        case ',': return row == 4 ? 6 : 0;
+        case '!': return row < 4 ? 4 : 0;
+        case ':': return (row == 1 || row == 3) ? 4 : 0;
+        case '?': return row == 0 ? 14 : row == 1 ? 1 : row == 2 ? 6 : row == 4 ? 4 : 0;
+        case '/': return (uint8_t)(1U << (4 - row));
+        case ' ': return 0;
+        default: return 0;
+    }
+}
 
 static void pixel(int x, int y, bool on = true)
 {
@@ -192,6 +297,107 @@ static void pixel(int x, int y, bool on = true)
     if (on) b |= m;
     else b &= (uint8_t)~m;
 }
+
+static void draw_text_char(int x, int y, char c)
+{
+    for (int row = 0; row < 5; ++row) {
+        uint8_t bits = text_glyph_row(c, row);
+        for (int col = 0; col < 5; ++col) {
+            if (bits & (1U << (4 - col))) pixel(x + col, y + row, true);
+        }
+    }
+}
+
+static void draw_scrolling_text(const char *text, uint16_t &offset, int text_x)
+{
+    if (!text || !text[0]) return;
+
+    constexpr int TEXT_Y = OLED_HEIGHT - 5;
+    constexpr int CHAR_WIDTH = 6;
+    constexpr int TEXT_RIGHT = OLED_WIDTH - 1;
+    constexpr int GAP_PX = 12;
+
+    const size_t len = strlen(text);
+    const int text_px = (int)len * CHAR_WIDTH;
+    const int visible_width = TEXT_RIGHT - text_x + 1;
+
+    if (visible_width <= 5) return;
+
+    if (text_px <= visible_width) {
+        for (size_t i = 0; i < len; ++i)
+            draw_text_char(text_x + (int)i * CHAR_WIDTH, TEXT_Y, text[i]);
+        offset = 0;
+        return;
+    }
+
+    const int cycle_px = text_px + GAP_PX;
+    int pos = text_x - (int)offset;
+
+    for (size_t i = 0; i < len; ++i) {
+        int x = pos + (int)i * CHAR_WIDTH;
+        if (x + 5 >= text_x && x <= TEXT_RIGHT)
+            draw_text_char(x, TEXT_Y, text[i]);
+    }
+
+    pos += cycle_px;
+    for (size_t i = 0; i < len; ++i) {
+        int x = pos + (int)i * CHAR_WIDTH;
+        if (x + 5 >= text_x && x <= TEXT_RIGHT)
+            draw_text_char(x, TEXT_Y, text[i]);
+    }
+
+    offset = (uint16_t)((offset + 2) % cycle_px);
+}
+
+static void draw_current_scroll_text(int rssi_end_x)
+{
+    char text[256] = {0};
+    uint16_t offset = 0;
+    bool enabled = false;
+
+    portENTER_CRITICAL(&scroll_text_mux);
+    if (current_face_state == FACE_LISTENING) {
+        strncpy(text, user_scroll_text, sizeof(text) - 1);
+        offset = user_scroll_offset;
+        enabled = true;
+    } else if (current_face_state == FACE_SPEAKING) {
+        strncpy(text, gemini_scroll_text, sizeof(text) - 1);
+        offset = gemini_scroll_offset;
+        enabled = true;
+    }
+    portEXIT_CRITICAL(&scroll_text_mux);
+
+    if (!enabled || !text[0]) return;
+
+    const int text_x = rssi_end_x > 0 ? rssi_end_x + 4 : 4;
+    draw_scrolling_text(text, offset, text_x);
+
+    portENTER_CRITICAL(&scroll_text_mux);
+    if (current_face_state == FACE_LISTENING)
+        user_scroll_offset = offset;
+    else if (current_face_state == FACE_SPEAKING)
+        gemini_scroll_offset = offset;
+    portEXIT_CRITICAL(&scroll_text_mux);
+}
+
+void face_set_state(face_state_t state)
+{
+    if (current_face_state == state) return;
+
+    current_face_state = state;
+
+    portENTER_CRITICAL(&scroll_text_mux);
+    if (state == FACE_LISTENING) {
+        user_scroll_text[0] = '\0';
+        user_scroll_offset = 0;
+    } else if (state == FACE_SPEAKING) {
+        gemini_scroll_text[0] = '\0';
+        gemini_scroll_offset = 0;
+    }
+    portEXIT_CRITICAL(&scroll_text_mux);
+}
+
+face_state_t face_get_state(void) { return current_face_state; }
 
 static void fill_circle(int cx, int cy, int r, bool on = true)
 {
@@ -289,7 +495,8 @@ void display_render_mochi_gaze(int expr, int step, int sX, int sY, int gaze_x, i
     if (step == 3) {
         draw_sleep_eye(L, Y);
         draw_sleep_eye(R, Y);
-        draw_rssi();
+        int rssi_end_x = draw_rssi();
+        draw_current_scroll_text(rssi_end_x);
         display_render_buffer(face_buffer);
         return;
     }
@@ -320,7 +527,8 @@ void display_render_mochi_gaze(int expr, int step, int sX, int sY, int gaze_x, i
         draw_open_eye(R, Y, gaze_x, gaze_y);
     }
 
-    draw_rssi();
+    int rssi_end_x = draw_rssi();
+    draw_current_scroll_text(rssi_end_x);
     display_render_buffer(face_buffer);
 }
 
