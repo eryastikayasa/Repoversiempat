@@ -238,14 +238,14 @@ void display_set_gemini_text(const char *text)
     portEXIT_CRITICAL(&scroll_text_mux);
 }
 
-static void display_append_user_text(const char *text)
+void display_append_user_text(const char *text)
 {
     portENTER_CRITICAL(&scroll_text_mux);
     append_scroll_text(user_scroll_text, sizeof(user_scroll_text), text);
     portEXIT_CRITICAL(&scroll_text_mux);
 }
 
-static void display_append_gemini_text(const char *text)
+void display_append_gemini_text(const char *text)
 {
     portENTER_CRITICAL(&scroll_text_mux);
     append_scroll_text(gemini_scroll_text, sizeof(gemini_scroll_text), text);
