@@ -346,7 +346,7 @@ static void draw_scrolling_text(const char *text, uint16_t &offset, int text_x)
             draw_text_char(x, TEXT_Y, text[i]);
     }
 
-    offset = (uint16_t)((offset + 2) % cycle_px);
+    offset = (uint16_t)((offset + 1) % cycle_px);
 }
 
 static void draw_current_scroll_text(int rssi_end_x)
