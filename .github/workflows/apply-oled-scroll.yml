@@ -1,0 +1,218 @@
+name: Apply OLED scrolling transcription
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Patch OLED scrolling text
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          h = Path('components/display/include/display.h')
+          s = h.read_text()
+          old = 'void display_status(const char *status);\n'
+          new = old + 'void display_set_user_text(const char *text);\nvoid display_set_gemini_text(const char *text);\n'
+          if 'void display_set_user_text' not in s:
+              if old not in s: raise SystemExit('display.h insertion point not found')
+              s = s.replace(old, new, 1)
+              h.write_text(s)
+
+          p = Path('components/display/display.cpp')
+          s = p.read_text()
+          if 'static char user_scroll_text[256]' not in s:
+              s = s.replace(
+                  '#include <stdio.h>\n',
+                  '#include <stdio.h>\n#include <ctype.h>\n', 1)
+              anchor = 'static EXT_RAM_BSS_ATTR uint8_t face_buffer[OLED_WIDTH * OLED_HEIGHT / 8];\n'
+              block = r'''
+
+static char user_scroll_text[256] = {0};
+static char gemini_scroll_text[256] = {0};
+static uint16_t user_scroll_offset = 0;
+static uint16_t gemini_scroll_offset = 0;
+static portMUX_TYPE scroll_text_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static void copy_scroll_text(char *dst, size_t dst_size, const char *src)
+{
+    if (!dst || dst_size == 0) return;
+    dst[0] = '\0';
+    if (!src) return;
+
+    size_t j = 0;
+    for (size_t i = 0; src[i] != '\0' && j + 1 < dst_size; ++i) {
+        unsigned char c = (unsigned char)src[i];
+        if (c < 0x20 || c > 0x7E) continue;
+        dst[j++] = (char)c;
+    }
+    dst[j] = '\0';
+}
+
+void display_set_user_text(const char *text)
+{
+    portENTER_CRITICAL(&scroll_text_mux);
+    copy_scroll_text(user_scroll_text, sizeof(user_scroll_text), text);
+    user_scroll_offset = 0;
+    portEXIT_CRITICAL(&scroll_text_mux);
+}
+
+void display_set_gemini_text(const char *text)
+{
+    portENTER_CRITICAL(&scroll_text_mux);
+    copy_scroll_text(gemini_scroll_text, sizeof(gemini_scroll_text), text);
+    gemini_scroll_offset = 0;
+    portEXIT_CRITICAL(&scroll_text_mux);
+}
+
+static uint8_t text_glyph_row(char c, int row)
+{
+    static const uint8_t letters[26][5] = {
+        {14,17,31,17,17}, {30,17,30,17,30}, {15,16,16,16,15},
+        {30,17,17,17,30}, {31,16,30,16,31}, {31,16,30,16,16},
+        {15,16,23,17,15}, {17,17,31,17,17}, {31,4,4,4,31},
+        {7,2,2,18,12}, {17,18,28,18,17}, {16,16,16,16,31},
+        {17,27,21,17,17}, {17,25,21,19,17}, {14,17,17,17,14},
+        {30,17,30,16,16}, {14,17,21,19,15}, {30,17,30,18,17},
+        {15,16,14,1,30}, {31,4,4,4,4}, {17,17,17,17,14},
+        {17,17,17,10,4}, {17,17,21,27,17}, {17,10,4,10,17},
+        {17,10,4,4,4}, {31,2,4,8,31}
+    };
+    static const uint8_t digits[10][5] = {
+        {14,17,19,21,14}, {4,12,4,4,14}, {14,1,6,8,31},
+        {30,1,6,1,30}, {18,18,31,2,2}, {31,16,30,1,30},
+        {14,16,30,17,14}, {31,1,2,4,4}, {14,17,14,17,14},
+        {14,17,15,1,14}
+    };
+
+    if (c >= 'a' && c <= 'z') c = (char)(c - 'a' + 'A');
+    if (c >= 'A' && c <= 'Z') return letters[c - 'A'][row];
+    if (c >= '0' && c <= '9') return digits[c - '0'][row];
+
+    switch (c) {
+        case '-': return row == 2 ? 14 : 0;
+        case '.': return row == 4 ? 4 : 0;
+        case ',': return row == 4 ? 6 : 0;
+        case '!': return (row == 4) ? 4 : (row < 4 ? 4 : 0);
+        case ':': return (row == 1 || row == 3) ? 4 : 0;
+        case '?': return row == 0 ? 14 : row == 1 ? 1 : row == 2 ? 6 : row == 4 ? 4 : 0;
+        case '/': return (uint8_t)(1U << (4 - row));
+        case ' ': return 0;
+        default: return 0;
+    }
+}
+
+static void draw_text_char(int x, int y, char c)
+{
+    for (int row = 0; row < 5; ++row) {
+        uint8_t bits = text_glyph_row(c, row);
+        for (int col = 0; col < 5; ++col) {
+            if (bits & (1U << (4 - col))) pixel(x + col, y + row, true);
+        }
+    }
+}
+
+static void draw_scrolling_text(const char *text, uint16_t &offset)
+{
+    if (!text || !text[0]) return;
+
+    constexpr int TEXT_X = 23;
+    constexpr int TEXT_Y = OLED_HEIGHT - 5;
+    constexpr int CHAR_WIDTH = 6;
+    constexpr int TEXT_RIGHT = OLED_WIDTH - 1;
+    constexpr int GAP_PX = 12;
+
+    const size_t len = strlen(text);
+    const int text_px = (int)len * CHAR_WIDTH;
+    const int cycle_px = text_px + GAP_PX;
+    if (cycle_px <= 0) return;
+
+    int pos = TEXT_X - (int)offset;
+    for (size_t i = 0; i < len; ++i) {
+        int x = pos + (int)i * CHAR_WIDTH;
+        if (x + 5 >= TEXT_X && x <= TEXT_RIGHT)
+            draw_text_char(x, TEXT_Y, text[i]);
+    }
+
+    pos += cycle_px;
+    for (size_t i = 0; i < len; ++i) {
+        int x = pos + (int)i * CHAR_WIDTH;
+        if (x + 5 >= TEXT_X && x <= TEXT_RIGHT)
+            draw_text_char(x, TEXT_Y, text[i]);
+    }
+
+    offset = (uint16_t)((offset + 2) % cycle_px);
+}
+
+static void draw_current_scroll_text()
+{
+    char text[256];
+    uint16_t offset;
+    bool enabled = false;
+
+    portENTER_CRITICAL(&scroll_text_mux);
+    if (current_face_state == FACE_LISTENING) {
+        strncpy(text, user_scroll_text, sizeof(text));
+        text[sizeof(text) - 1] = '\0';
+        offset = user_scroll_offset;
+        enabled = true;
+    } else if (current_face_state == FACE_SPEAKING) {
+        strncpy(text, gemini_scroll_text, sizeof(text));
+        text[sizeof(text) - 1] = '\0';
+        offset = gemini_scroll_offset;
+        enabled = true;
+    }
+    portEXIT_CRITICAL(&scroll_text_mux);
+
+    if (!enabled || !text[0]) return;
+    draw_scrolling_text(text, offset);
+
+    portENTER_CRITICAL(&scroll_text_mux);
+    if (current_face_state == FACE_LISTENING)
+        user_scroll_offset = offset;
+    else if (current_face_state == FACE_SPEAKING)
+        gemini_scroll_offset = offset;
+    portEXIT_CRITICAL(&scroll_text_mux);
+}
+'''
+              if anchor not in s: raise SystemExit('display.cpp anchor not found')
+              s = s.replace(anchor, anchor + block, 1)
+              # pixel() is defined later; provide a forward declaration.
+              s = s.replace(
+                  'static void draw_text_char(int x, int y, char c)\n',
+                  'static void pixel(int x, int y, bool on = true);\n\nstatic void draw_text_char(int x, int y, char c)\n', 1)
+              s = s.replace(
+                  '    draw_rssi();\n    display_render_buffer(face_buffer);',
+                  '    draw_rssi();\n    draw_current_scroll_text();\n    display_render_buffer(face_buffer);', 2)
+              p.write_text(s)
+
+          w = Path('components/websocket/websocket_json.cpp')
+          s = w.read_text()
+          old_user = '''        if (cJSON_IsString(text) && text->valuestring)\n            ESP_LOGI(TAG, "USER: %s", text->valuestring);'''
+          new_user = '''        if (cJSON_IsString(text) && text->valuestring) {\n            ESP_LOGI(TAG, "USER: %s", text->valuestring);\n            display_set_user_text(text->valuestring);\n        }'''
+          old_gemini = '''        if (cJSON_IsString(text) && text->valuestring)\n            ESP_LOGI(TAG, "GEMINI TEXT: %s", text->valuestring);'''
+          new_gemini = '''        if (cJSON_IsString(text) && text->valuestring) {\n            ESP_LOGI(TAG, "GEMINI TEXT: %s", text->valuestring);\n            display_set_gemini_text(text->valuestring);\n        }'''
+          if old_user not in s: raise SystemExit('USER transcription insertion point not found')
+          if old_gemini not in s: raise SystemExit('GEMINI transcription insertion point not found')
+          s = s.replace(old_user, new_user, 1)
+          s = s.replace(old_gemini, new_gemini, 1)
+          w.write_text(s)
+          PY
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add components/display/include/display.h components/display/display.cpp components/websocket/websocket_json.cpp
+          git diff --cached --quiet && { echo "No changes"; exit 0; }
+          git commit -m "feat: scroll user and Gemini text on OLED"
+          git push
