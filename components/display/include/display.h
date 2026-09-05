@@ -28,6 +28,8 @@ extern "C" {
 
 void oled_init(void);
 void display_status(const char *status);
+void display_set_user_text(const char *text);
+void display_set_gemini_text(const char *text);
 void face_render(void);
 void display_render_buffer(const uint8_t *buffer);
 
