@@ -6,6 +6,7 @@
 #include "esp_lcd_panel_vendor.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
+#include "esp_wifi.h"
 #include <string.h>
 #include <math.h>
 #include "esp_attr.h"
@@ -24,6 +25,62 @@ static void draw_buffer_locked(const uint8_t *buffer)
     if (!panel || !buffer) return;
     esp_err_t err = esp_lcd_panel_draw_bitmap(panel, 0, 0, OLED_WIDTH, OLED_HEIGHT, buffer);
     if (err != ESP_OK) ESP_LOGW(TAG, "OLED draw gagal: %s", esp_err_to_name(err));
+}
+
+static void draw_rssi_char(int x, int y, char c)
+{
+    static const uint8_t glyphs[][5] = {
+        {0x00,0x00,0x1F,0x00,0x00},
+        {0x1E,0x11,0x11,0x11,0x1E},
+        {0x00,0x12,0x1F,0x10,0x00},
+        {0x12,0x19,0x15,0x13,0x12},
+        {0x11,0x15,0x15,0x15,0x0A},
+        {0x07,0x04,0x04,0x1F,0x04},
+        {0x17,0x15,0x15,0x15,0x09},
+        {0x0E,0x15,0x15,0x15,0x08},
+        {0x01,0x01,0x19,0x05,0x03},
+        {0x0A,0x15,0x15,0x15,0x0A},
+        {0x02,0x15,0x15,0x15,0x0E},
+    };
+
+    int index = (c == '-') ? 0 : (c - '0' + 1);
+    if (index < 0 || index >= (int)(sizeof(glyphs) / sizeof(glyphs[0]))) return;
+
+    for (int col = 0; col < 5; ++col) {
+        uint8_t bits = glyphs[index][col];
+        for (int row = 0; row < 5; ++row) {
+            if (bits & (1U << row)) {
+                int px = x + col;
+                int py = y + row;
+                if (px >= 0 && px < OLED_WIDTH && py >= 0 && py < OLED_HEIGHT) {
+                    uint8_t &b = face_buffer[px + (py >> 3) * OLED_WIDTH];
+                    b |= (uint8_t)(1U << (py & 7));
+                }
+            }
+        }
+    }
+}
+
+static void draw_rssi(void)
+{
+    wifi_ap_record_t ap_info = {};
+    if (esp_wifi_sta_get_ap_info(&ap_info) != ESP_OK) return;
+
+    int rssi = ap_info.rssi;
+    if (rssi > 0) rssi = 0;
+    if (rssi < -99) rssi = -99;
+
+    char text[5];
+    snprintf(text, sizeof(text), "%d", rssi);
+
+    const int char_width = 6;
+    int x = 0;
+    const int y = OLED_HEIGHT - 5;
+
+    for (size_t i = 0; text[i] != '\0'; ++i) {
+        draw_rssi_char(x, y, text[i]);
+        x += char_width;
+    }
 }
 
 void oled_init(void)
@@ -231,6 +288,7 @@ void display_render_mochi_gaze(int expr, int step, int sX, int sY, int gaze_x, i
     if (step == 3) {
         draw_sleep_eye(L, Y);
         draw_sleep_eye(R, Y);
+        draw_rssi();
         display_render_buffer(face_buffer);
         return;
     }
@@ -261,6 +319,7 @@ void display_render_mochi_gaze(int expr, int step, int sX, int sY, int gaze_x, i
         draw_open_eye(R, Y, gaze_x, gaze_y);
     }
 
+    draw_rssi();
     display_render_buffer(face_buffer);
 }
 
