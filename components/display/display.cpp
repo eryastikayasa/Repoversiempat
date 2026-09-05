@@ -10,6 +10,7 @@
 #include <string.h>
 #include <math.h>
 #include "esp_attr.h"
+#include <stdio.h>
 
 static const char *TAG = "DISPLAY";
 static i2c_master_bus_handle_t i2c_bus = NULL;
