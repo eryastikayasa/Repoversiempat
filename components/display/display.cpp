@@ -307,7 +307,6 @@ static void draw_text_char(int x, int y, char c)
         }
     }
 }
-
 static void draw_scrolling_text(const char *text, uint16_t &offset, int text_x)
 {
     if (!text || !text[0]) return;
@@ -323,29 +322,57 @@ static void draw_scrolling_text(const char *text, uint16_t &offset, int text_x)
 
     if (visible_width <= 5) return;
 
+    // Teks pendek: tampil penuh dan tidak berjalan.
     if (text_px <= visible_width) {
-        for (size_t i = 0; i < len; ++i)
-            draw_text_char(text_x + (int)i * CHAR_WIDTH, TEXT_Y, text[i]);
+        for (size_t i = 0; i < len; ++i) {
+            draw_text_char(
+                text_x + (int)i * CHAR_WIDTH,
+                TEXT_Y,
+                text[i]
+            );
+        }
+
         offset = 0;
         return;
     }
 
+    /*
+     * Marquee:
+     *
+     * teks masuk dari kanan
+     *        ↓
+     * [       halo gemini]
+     * [   halo gemini    ]
+     * [halo gemini       ]
+     * [     halo gemini  ]
+     *
+     * Kemudian mengulang dengan GAP_PX.
+     */
     const int cycle_px = text_px + GAP_PX;
-    int pos = text_x - (int)offset;
 
+    int pos = TEXT_RIGHT + 1 - (int)offset;
+
+    // Salinan pertama.
     for (size_t i = 0; i < len; ++i) {
         int x = pos + (int)i * CHAR_WIDTH;
-        if (x + 5 >= text_x && x <= TEXT_RIGHT)
+
+        if (x + 5 >= text_x && x <= TEXT_RIGHT) {
             draw_text_char(x, TEXT_Y, text[i]);
+        }
     }
 
+    // Salinan kedua untuk membuat loop tanpa putus.
     pos += cycle_px;
+
     for (size_t i = 0; i < len; ++i) {
         int x = pos + (int)i * CHAR_WIDTH;
-        if (x + 5 >= text_x && x <= TEXT_RIGHT)
+
+        if (x + 5 >= text_x && x <= TEXT_RIGHT) {
             draw_text_char(x, TEXT_Y, text[i]);
+        }
     }
 
+    // Tetap 1 pixel setiap kali fungsi dipanggil.
     offset = (uint16_t)((offset + 1) % cycle_px);
 }
 
