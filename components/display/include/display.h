@@ -51,7 +51,7 @@ void display_render_mochi_gaze(
     int sX,
     int sY,
     int gaze_x,
-    int gaze_y
+    int gaze_y, 
     int eye_shift_x,
     int eye_shift_y
 );
