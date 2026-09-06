@@ -3,7 +3,9 @@
 #include "esp_err.h"
 #include "esp_aec.h"
 #include "esp_nsn_iface.h"
+extern "C" {
 #include "esp_nsn_models.h"
+}
 #include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
