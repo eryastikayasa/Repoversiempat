@@ -22,7 +22,7 @@ static SemaphoreHandle_t audio_send_mutex = NULL;
 #define AUDIO_OUTPUT_SAMPLE_RATE       24000U
 #define AUDIO_OUTPUT_BYTES_PER_SEC     (AUDIO_OUTPUT_SAMPLE_RATE * 2U)
 #define AUDIO_RING_BUFFER_SIZE         (512 * 1024)
-#define AUDIO_PLAYBACK_PREBUFFER_SIZE  (32 * 1024)
+#define AUDIO_PLAYBACK_PREBUFFER_SIZE  (16 * 1024)
 #define AUDIO_PLAYBACK_READ_SIZE       2048
 #define AUDIO_PLAYBACK_READ_WAIT_MS    5
 #define AUDIO_PLAYBACK_TRIGGER_SIZE    1024
@@ -150,9 +150,12 @@ static void audio_playback_task(void *arg)
         if (playback_started && pending == 0 && audio_turn_active &&
             !audio_turn_complete_pending) {
             if (!underrun_reported) {
-                ESP_LOGW(TAG, "AUDIO PLAYBACK UNDERRUN: PCM buffer kosong di tengah turn");
+                ESP_LOGW(TAG, "AUDIO PLAYBACK UNDERRUN: PCM buffer kosong di tengah turn - rebuffer");
                 underrun_reported = true;
             }
+            // The server can deliver output in bursts. Do not resume on a tiny
+            // fragment after an underrun; wait for the normal prebuffer again.
+            playback_started = false;
             vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAYBACK_READ_WAIT_MS));
             continue;
         }
