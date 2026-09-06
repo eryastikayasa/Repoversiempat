@@ -312,7 +312,7 @@ static void audio_task(void *arg)
         if (buffer_pos >= 3200) {
             bool has_activity = mic_frame_has_activity(audio_buffer, 3200); if (has_activity) last_user_activity_us = esp_timer_get_time(); int64_t now_us = esp_timer_get_time();
             if (now_us - last_user_activity_us > 60 * 1000000LL) { ESP_LOGI(TAG, "Idle 60 detik, menutup sesi."); assistant_active = false; face_set_state(FACE_SLEEP); websocket_disconnect(); buffer_pos = 0; continue; }
-            if (!audio_turn_active) { if (has_activity) websocket_send_audio_data(audio_buffer, 3200); else { silent_frames++; int64_t now_log = esp_timer_get_time(); if (last_silent_log_us == 0 || now_log - last_silent_log_us >= 1000000) { last_silent_log_us = now_log; ESP_LOGI(TAG, "V7.0.36 MIC TX gate: silent frames dropped=%lu", (unsigned long)silent_frames); } } }
+            if (has_activity) { websocket_send_audio_data(audio_buffer, 3200); } else { silent_frames++; int64_t now_log = esp_timer_get_time(); if (last_silent_log_us == 0 || now_log - last_silent_log_us >= 1000000) { last_silent_log_us = now_log; ESP_LOGI(TAG, "V7.0.37 MIC TX: silent frames dropped=%lu", (unsigned long)silent_frames); } }
             size_t remainder = buffer_pos - 3200; if (remainder > 0) memmove(audio_buffer, audio_buffer + 3200, remainder); buffer_pos = remainder;
         }
         vTaskDelay(pdMS_TO_TICKS(10));
