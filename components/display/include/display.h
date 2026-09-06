@@ -52,6 +52,8 @@ void display_render_mochi_gaze(
     int sY,
     int gaze_x,
     int gaze_y
+    int eye_shift_x,
+    int eye_shift_y
 );
 
 void face_animation_start(void);
