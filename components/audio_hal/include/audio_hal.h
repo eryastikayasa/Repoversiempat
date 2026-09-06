@@ -27,7 +27,6 @@
 
 #define AUDIO_BITS 16
 
-
 void audio_hal_init(void);
 
 void audio_i2s_test_tone(void);
