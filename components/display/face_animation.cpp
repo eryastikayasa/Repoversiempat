@@ -29,18 +29,40 @@ static bool state_ok(face_state_t state)
     return face_get_state() == state;
 }
 
-static void render(int expr, int step, int sx, int sy, int gaze_x, int gaze_y)
+static void render(
+    int expr,
+    int step,
+    int sx,
+    int sy,
+    int gaze_x,
+    int gaze_y,
+    int eye_shift_x = 0,
+    int eye_shift_y = 0)
 {
-    display_render_mochi_gaze(expr, step, sx, sy, gaze_x, gaze_y);
+    display_render_mochi_gaze(
+        expr,
+        step,
+        sx,
+        sy,
+        gaze_x,
+        gaze_y,
+        eye_shift_x,
+        eye_shift_y
+    );
 }
 
-static bool smooth_gaze(face_state_t state,
-                        int expr,
-                        int from_x,
-                        int from_y,
-                        int to_x,
-                        int to_y,
-                        uint32_t frames)
+static bool smooth_gaze(
+    face_state_t state,
+    int expr,
+    int from_x,
+    int from_y,
+    int to_x,
+    int to_y,
+    uint32_t frames,
+    int from_eye_x = 0,
+    int from_eye_y = 0,
+    int to_eye_x = 0,
+    int to_eye_y = 0)
 {
     if (!state_ok(state)) return false;
     if (frames == 0) frames = 1;
@@ -48,13 +70,34 @@ static bool smooth_gaze(face_state_t state,
     for (uint32_t i = 1; i <= frames; ++i) {
         if (!state_ok(state)) return false;
 
-        // Smoothstep avoids a robotic constant-speed jump at the endpoints.
+        // Smoothstep:
+        // mulai perlahan -> bergerak -> berhenti perlahan.
         float t = (float)i / (float)frames;
         t = t * t * (3.0f - 2.0f * t);
 
-        int gx = from_x + (int)((to_x - from_x) * t);
-        int gy = from_y + (int)((to_y - from_y) * t);
-        render(expr, 0, 0, 0, gx, gy);
+        int gx =
+            from_x + (int)((to_x - from_x) * t);
+
+        int gy =
+            from_y + (int)((to_y - from_y) * t);
+
+        int ex =
+            from_eye_x + (int)((to_eye_x - from_eye_x) * t);
+
+        int ey =
+            from_eye_y + (int)((to_eye_y - from_eye_y) * t);
+
+        render(
+            expr,
+            0,
+            0,
+            0,
+            gx,
+            gy,
+            ex,
+            ey
+        );
+
         vTaskDelay(FRAME_DELAY);
     }
 
