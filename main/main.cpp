@@ -264,7 +264,7 @@ static bool mic_frame_has_activity(const uint8_t *data, size_t len)
         return false;
     }
 
-    constexpr int32_t SILENCE_THRESHOLD = 500;
+    constexpr int32_t SILENCE_THRESHOLD = 150;
     constexpr size_t MIN_ACTIVE_SAMPLES = 8;
     size_t active_samples = 0;
 
