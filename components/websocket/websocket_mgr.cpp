@@ -126,9 +126,9 @@ static void websocket_tx_task(void *arg)
             free(setup_json); free(audio_data); continue;
         }
         if (cmd.type == WS_TX_COMMAND_AUDIO) {
-            static char b64_buf[2300];
-            static char json_buf[2500];
-            constexpr size_t PCM_SEND_CHUNK = 1600;
+            static char b64_buf[1000];
+            static char json_buf[1200];
+            constexpr size_t PCM_SEND_CHUNK = 640;
             constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
             constexpr TickType_t AUDIO_SEND_RETRY_DELAY = pdMS_TO_TICKS(30);
             constexpr int AUDIO_SEND_RETRIES = 1;
