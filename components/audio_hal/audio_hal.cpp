@@ -16,15 +16,14 @@ static i2s_chan_handle_t tx_handle = NULL;
 
 // ESP-SR AEC works at 16 kHz. The speaker path is 24 kHz, so a small
 // real-time 24k -> 16k reference queue is maintained from the samples that
-// are actually written to the I2S speaker. This gives AEC the far-end signal
-// at the acoustic output boundary instead of the still-buffered Gemini PCM.
-constexpr size_t AEC_FRAME_SAMPLES = 512;       // 32 ms @ 16 kHz
-constexpr size_t AEC_REF_RING_SAMPLES = 32768;  // ~2.0 s @ 16 kHz
+// are actually written to the I2S speaker.
+constexpr size_t AEC_FRAME_SAMPLES = 512;
+constexpr size_t AEC_REF_RING_SAMPLES = 32768;
 
 static aec_handle_t *aec_handle = NULL;
 static int16_t aec_ref_ring[AEC_REF_RING_SAMPLES];
-static volatile size_t aec_ref_read = 0;
-static volatile size_t aec_ref_write = 0;
+static size_t aec_ref_read = 0;
+static size_t aec_ref_write = 0;
 static portMUX_TYPE aec_ref_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool aec_ready = false;
 
@@ -37,9 +36,6 @@ static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
 {
     if (!pcm || samples == 0) return;
 
-    // 24 kHz -> 16 kHz, exact 2/3 rate. A simple phase-locked sample
-    // selection is sufficient for the AEC reference because the AEC filter
-    // adapts to the acoustic path; it avoids adding another large resampler.
     static uint32_t phase = 0;
     constexpr uint32_t STEP = 2;
     constexpr uint32_t DEN = 3;
@@ -86,7 +82,7 @@ static void aec_init(void)
     config.out_num = 1;
     config.filter_length = 4;
     config.sample_rate = MIC_SAMPLE_RATE;
-    config.caps = MALLOC_CAP_PSRAM | MALLOC_CAP_8BIT;
+    config.caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
     config.mode = AEC_MODE_FD_LOW_COST;
     config.nlp_level = AEC_NLP_LEVEL_NORMAL;
 
@@ -130,8 +126,6 @@ void audio_hal_init(void)
     rx_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED; rx_cfg.gpio_cfg.din = MIC_I2S_SD;
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle, &rx_cfg));
 
-    // Keep the proven v6.1.5 MAX98357A format: 32-bit I2S slots, LEFT, Philips.
-    // Gemini audio remains PCM16/24k; conversion happens only at the I2S boundary.
     i2s_std_config_t tx_cfg = {};
     tx_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SPK_SAMPLE_RATE);
     tx_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
@@ -166,8 +160,6 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
     int16_t *pcm = reinterpret_cast<int16_t *>(dest);
     for (size_t i = 0; i < samples; ++i) pcm[i] = static_cast<int16_t>(raw[i] >> 16);
 
-    // audio_task normally receives a full 512-sample frame. Only invoke AEC
-    // when the complete frame is available; partial frames remain untouched.
     if (aec_ready && samples == AEC_FRAME_SAMPLES) {
         memcpy(mic_frame, pcm, sizeof(mic_frame));
         aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES);
@@ -187,21 +179,6 @@ void audio_write_speaker(const uint8_t *src, size_t len)
     const int16_t *pcm = reinterpret_cast<const int16_t *>(src);
     size_t total = len / sizeof(int16_t), offset = 0;
 
-    /*
-     * v7.0.34: keep the bounded I2S write from v7.0.33, but also yield after
-     * every successful DMA chunk. v7.0.33 only yielded when I2S stalled; a
-     * stream of successful 512-sample writes could still keep audio_playback
-     * runnable on CPU1 long enough to starve IDLE1 and trigger Task WDT.
-     *
-     * ESP-IDF 6.x uses a millisecond timeout for i2s_channel_write().
-     * Do not pass portMAX_DELAY here: that value is an RTOS tick sentinel,
-     * not an I2S timeout in milliseconds. Bound each DMA wait so a stalled
-     * speaker path cannot monopolize CPU1 and starve IDLE1/WDT.
-     *
-     * 512 PCM samples = 21.3 ms of 24 kHz audio in the 32-bit I2S path.
-     * The explicit scheduler yield below gives other CPU1 tasks a chance
-     * between chunks without changing the I2S format or DMA configuration.
-     */
     constexpr size_t I2S_WRITE_SAMPLES = 512;
     constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
 
@@ -223,8 +200,6 @@ void audio_write_speaker(const uint8_t *src, size_t len)
             return;
         }
 
-        // Feed the exact samples that just reached the I2S write boundary to
-        // the AEC reference path. The AEC consumer runs from the MIC task.
         if (aec_ready) {
             for (size_t i = 0; i < n; ++i) ref_pcm[i] = pcm[offset - n + i];
             aec_ref_push_24k(ref_pcm, n);
