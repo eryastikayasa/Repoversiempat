@@ -217,13 +217,25 @@ void audio_write_speaker(const uint8_t *src, size_t len)
     constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
 
     while (offset < total) {
-        size_t n = total - offset; if (n > I2S_WRITE_SAMPLES) n = I2S_WRITE_SAMPLES;
-        for (size_t i = 0; i < n; ++i) tx_buffer[i] = static_cast<int32_t>(pcm[offset + i]) << 16;
+        const size_t old_offset = offset;
+        size_t n = total - offset;
+        if (n > I2S_WRITE_SAMPLES) n = I2S_WRITE_SAMPLES;
+        for (size_t i = 0; i < n; ++i) tx_buffer[i] = static_cast<int32_t>(pcm[old_offset + i]) << 16;
 
         size_t written = 0;
         esp_err_t err = i2s_channel_write(tx_handle, tx_buffer, n * sizeof(int32_t), &written, I2S_WRITE_TIMEOUT_MS);
         size_t samples_written = written / sizeof(int32_t);
         if (samples_written > n) samples_written = n;
+
+        // AEC reference must contain only samples that were actually accepted by I2S.
+        // This also avoids the old offset-n underflow when I2S performs a partial write.
+        if (aec_ready && samples_written > 0) {
+            for (size_t i = 0; i < samples_written; ++i) {
+                ref_pcm[i] = pcm[old_offset + i];
+            }
+            aec_ref_push_24k(ref_pcm, samples_written);
+        }
+
         offset += samples_written;
 
         if (err != ESP_OK || samples_written == 0) {
@@ -234,18 +246,13 @@ void audio_write_speaker(const uint8_t *src, size_t len)
             return;
         }
 
-        if (aec_ready) {
-            for (size_t i = 0; i < n; ++i) ref_pcm[i] = pcm[offset - n + i];
-            aec_ref_push_24k(ref_pcm, n);
-        }
-
         vTaskDelay(1);
     }
 }
 
 void audio_i2s_test_tone(void)
 {
-    static const int16_t sine_table[24] = {0,2071,4000,5657,6928,7727,8000,7727,6928,5657,4000,2071,0,-2071,-4000,-5657,-6928,-7727,-8000,-7727,-6928,-5657,-4000,-2071};
+    static const int16_t sine_table[24] = {0,2071,4000,5657,6928,7727,8000,7727,6928,5657,4000,2071,0,-2071,-4000,-5657,-6928,-7727,-8000,-6928,-5657,-4000,-2071};
     static int16_t tone[2400];
     if (!tx_handle) return;
     for (size_t i = 0; i < 2400; ++i) tone[i] = sine_table[i % 24];
