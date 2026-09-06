@@ -337,45 +337,42 @@ static void draw_scrolling_text(const char *text, uint16_t &offset, int text_x)
     }
 
     /*
-     * Marquee:
+     * Marquee kontinu:
      *
-     * teks masuk dari kanan
-     *        ↓
-     * [       halo gemini]
-     * [   halo gemini    ]
-     * [halo gemini       ]
-     * [     halo gemini  ]
-     *
-     * Kemudian mengulang dengan GAP_PX.
+     * 1. Teks masuk dari kanan.
+     * 2. Bergerak ke kiri.
+     * 3. Keluar sepenuhnya dari kiri.
+     * 4. GAP_PX kemudian teks berikutnya masuk.
      */
+
     const int cycle_px = text_px + GAP_PX;
 
+    // Posisi teks dihitung relatif terhadap batas kanan.
     int pos = TEXT_RIGHT + 1 - (int)offset;
 
     // Salinan pertama.
     for (size_t i = 0; i < len; ++i) {
-        int x = pos + (int)i * CHAR_WIDTH;
+        const int x = pos + (int)i * CHAR_WIDTH;
 
         if (x + 5 >= text_x && x <= TEXT_RIGHT) {
             draw_text_char(x, TEXT_Y, text[i]);
         }
     }
 
-    // Salinan kedua untuk membuat loop tanpa putus.
+    // Salinan kedua untuk menjaga loop tetap kontinu.
     pos += cycle_px;
 
     for (size_t i = 0; i < len; ++i) {
-        int x = pos + (int)i * CHAR_WIDTH;
+        const int x = pos + (int)i * CHAR_WIDTH;
 
         if (x + 5 >= text_x && x <= TEXT_RIGHT) {
             draw_text_char(x, TEXT_Y, text[i]);
         }
     }
 
-    // Tetap 1 pixel setiap kali fungsi dipanggil.
+    // Satu pixel setiap frame pemanggilan.
     offset = (uint16_t)((offset + 1) % cycle_px);
 }
-
 static void draw_current_scroll_text(int rssi_end_x)
 {
     char text[256] = {0};
