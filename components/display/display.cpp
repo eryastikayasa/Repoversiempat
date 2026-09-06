@@ -513,8 +513,15 @@ static void draw_error_eye(int cx, int cy)
     line(cx + s, cy - s, cx - s, cy + s);
 }
 
-void display_render_mochi_gaze(int expr, int step, int sX, int sY, int gaze_x, int gaze_y, int eye_shift_x,
-int eye_shift_y)
+void display_render_mochi_gaze(
+    int expr,
+    int step,
+    int sX,
+    int sY,
+    int gaze_x,
+    int gaze_y,
+    int eye_shift_x,
+    int eye_shift_y)
 {
     if (!oled_ready) oled_init();
     if (!oled_ready) return;
@@ -526,51 +533,106 @@ int eye_shift_y)
     const int Y = 28 + sY;
 
     if (step == 3) {
-        draw_sleep_eye(L, Y);
-        draw_sleep_eye(R, Y);
-        int rssi_end_x = draw_rssi();
-        draw_current_scroll_text(rssi_end_x);
-        display_render_buffer(face_buffer);
-        return;
-    }
+        draw_sleep_eye(
+            L + eye_shift_x,
+            Y + eye_shift_y
+        );
 
-    if (expr == 2 && step == 2) {
-        draw_happy_eye(L, Y);
-        draw_happy_eye(R, Y);
+        draw_sleep_eye(
+            R + eye_shift_x,
+            Y + eye_shift_y
+        );
+    }
+    else if (expr == 2 && step == 2) {
+        draw_happy_eye(
+            L + eye_shift_x,
+            Y + eye_shift_y
+        );
+
+        draw_happy_eye(
+            R + eye_shift_x,
+            Y + eye_shift_y
+        );
     }
     else if (expr == 2 || expr == 1 || expr == 0) {
         if (step == 1) {
-            draw_blink_eye(L, Y);
-            draw_blink_eye(R, Y);
-        } else {
-            draw_open_eye(L, Y, gaze_x, gaze_y);
-            draw_open_eye(R, Y, gaze_x, gaze_y);
+            draw_blink_eye(
+                L + eye_shift_x,
+                Y + eye_shift_y
+            );
+
+            draw_blink_eye(
+                R + eye_shift_x,
+                Y + eye_shift_y
+            );
+        }
+        else {
+            draw_open_eye(
+                L,
+                Y,
+                gaze_x,
+                gaze_y,
+                eye_shift_x,
+                eye_shift_y
+            );
+
+            draw_open_eye(
+                R,
+                Y,
+                gaze_x,
+                gaze_y,
+                eye_shift_x,
+                eye_shift_y
+            );
         }
     }
     else if (expr == 6) {
-        draw_sad_eye(L, Y);
-        draw_sad_eye(R, Y);
+        draw_sad_eye(
+            L + eye_shift_x,
+            Y + eye_shift_y
+        );
+
+        draw_sad_eye(
+            R + eye_shift_x,
+            Y + eye_shift_y
+        );
     }
     else if (expr == 99) {
-        draw_error_eye(L, Y);
-        draw_error_eye(R, Y);
+        draw_error_eye(
+            L + eye_shift_x,
+            Y + eye_shift_y
+        );
+
+        draw_error_eye(
+            R + eye_shift_x,
+            Y + eye_shift_y
+        );
     }
     else {
         draw_open_eye(
-    L, Y,
-    gaze_x, gaze_y,
-    eye_shift_x, eye_shift_y);
+            L,
+            Y,
+            gaze_x,
+            gaze_y,
+            eye_shift_x,
+            eye_shift_y
+        );
 
-draw_open_eye(
-    R, Y,
-    gaze_x, gaze_y,
-    eye_shift_x, eye_shift_y);
+        draw_open_eye(
+            R,
+            Y,
+            gaze_x,
+            gaze_y,
+            eye_shift_x,
+            eye_shift_y
+        );
+    }
 
     int rssi_end_x = draw_rssi();
     draw_current_scroll_text(rssi_end_x);
+
     display_render_buffer(face_buffer);
 }
-
 void display_render_mochi(int expr, int step, int sX, int sY, int arahLirik)
 {
     int gaze_x = 0;
@@ -583,7 +645,16 @@ void display_render_mochi(int expr, int step, int sX, int sY, int arahLirik)
         default: break;
     }
 
-    display_render_mochi_gaze(expr, step, sX, sY, gaze_x, gaze_y);
+    display_render_mochi_gaze(
+    expr,
+    step,
+    sX,
+    sY,
+    gaze_x,
+    gaze_y,
+    0,
+    0
+);
 }
 
 void face_render(void)
@@ -603,5 +674,14 @@ void face_render(void)
         default:             expr = 0; break;
     }
 
-    display_render_mochi_gaze(expr, step, 0, 0, 0, 0);
+    display_render_mochi_gaze(
+    expr,
+    step,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+);
 }
