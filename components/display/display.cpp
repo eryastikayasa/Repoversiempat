@@ -449,7 +449,13 @@ static void line(int x0, int y0, int x1, int y1)
     }
 }
 
-static void draw_open_eye(int cx, int cy, int gaze_x, int gaze_y)
+static void draw_open_eye(
+    int cx,
+    int cy,
+    int gaze_x,
+    int gaze_y,
+    int eye_shift_x,
+    int eye_shift_y)
 {
     const int eye_r = 14;
     const int pupil_r = 7;
@@ -459,15 +465,17 @@ static void draw_open_eye(int cx, int cy, int gaze_x, int gaze_y)
     if (gaze_y < -5) gaze_y = -5;
     if (gaze_y > 5) gaze_y = 5;
 
-    int px = cx + gaze_x;
-    int py = cy + gaze_y;
+    const int ex = cx + eye_shift_x;
+    const int ey = cy + eye_shift_y;
 
-    fill_circle(cx, cy, eye_r, true);
+    int px = ex + gaze_x;
+    int py = ey + gaze_y;
+
+    fill_circle(ex, ey, eye_r, true);
     fill_circle(px, py, pupil_r, false);
 
     fill_circle(px - 2, py - 3, 3, true);
 }
-
 static void draw_blink_eye(int cx, int cy)
 {
     line(cx - 11, cy, cx - 5, cy + 1);
@@ -505,7 +513,8 @@ static void draw_error_eye(int cx, int cy)
     line(cx + s, cy - s, cx - s, cy + s);
 }
 
-void display_render_mochi_gaze(int expr, int step, int sX, int sY, int gaze_x, int gaze_y)
+void display_render_mochi_gaze(int expr, int step, int sX, int sY, int gaze_x, int gaze_y, int eye_shift_x,
+int eye_shift_y)
 {
     if (!oled_ready) oled_init();
     if (!oled_ready) return;
@@ -547,9 +556,15 @@ void display_render_mochi_gaze(int expr, int step, int sX, int sY, int gaze_x, i
         draw_error_eye(R, Y);
     }
     else {
-        draw_open_eye(L, Y, gaze_x, gaze_y);
-        draw_open_eye(R, Y, gaze_x, gaze_y);
-    }
+        draw_open_eye(
+    L, Y,
+    gaze_x, gaze_y,
+    eye_shift_x, eye_shift_y);
+
+draw_open_eye(
+    R, Y,
+    gaze_x, gaze_y,
+    eye_shift_x, eye_shift_y);
 
     int rssi_end_x = draw_rssi();
     draw_current_scroll_text(rssi_end_x);
