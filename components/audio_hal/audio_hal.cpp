@@ -170,6 +170,8 @@ void audio_hal_ns_init(void)
 size_t audio_read_mic(uint8_t *dest, size_t max_len)
 {
     if (!rx_handle || !dest || max_len < sizeof(int16_t)) return 0;
+    if (!ns_ready) audio_hal_ns_init();
+
     static int32_t raw[512];
     static int16_t mic_frame[AEC_FRAME_SAMPLES];
     static int16_t ref_frame[AEC_FRAME_SAMPLES];
