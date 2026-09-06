@@ -61,6 +61,29 @@ static bool smooth_gaze(face_state_t state,
     return state_ok(state);
 }
 
+// Keep rendering the current face during LISTENING/SPEAKING holds so the
+// OLED marquee advances continuously instead of freezing during vTaskDelay().
+static bool hold_render(face_state_t state,
+                        int expr,
+                        int gaze_x,
+                        int gaze_y,
+                        uint32_t duration_ms)
+{
+    if (!state_ok(state)) return false;
+
+    const TickType_t total_ticks = pdMS_TO_TICKS(duration_ms);
+    const TickType_t start_tick = xTaskGetTickCount();
+
+    while ((xTaskGetTickCount() - start_tick) < total_ticks) {
+        if (!state_ok(state)) return false;
+
+        render(expr, 0, 0, 0, gaze_x, gaze_y);
+        vTaskDelay(FRAME_DELAY);
+    }
+
+    return state_ok(state);
+}
+
 static bool blink(face_state_t state, int expr, int gaze_x, int gaze_y)
 {
     if (!state_ok(state)) return false;
@@ -129,8 +152,11 @@ static void listening_sequence(void)
 {
     // Listening is attentive: mostly center, with small believable gaze shifts.
     if (!smooth_gaze(FACE_LISTENING, 1, 0, 0, 0, 0, 2)) return;
-    vTaskDelay(pdMS_TO_TICKS(350 + rnd(500)));
-    if (!state_ok(FACE_LISTENING)) return;
+    if (!hold_render(FACE_LISTENING,
+                     1,
+                     0,
+                     0,
+                     350 + rnd(500))) return;
 
     uint32_t b = rnd(100);
     int target_x = 0;
@@ -145,7 +171,11 @@ static void listening_sequence(void)
     }
 
     if (!smooth_gaze(FACE_LISTENING, 1, 0, 0, target_x, target_y, 4)) return;
-    vTaskDelay(pdMS_TO_TICKS(180 + rnd(260)));
+    if (!hold_render(FACE_LISTENING,
+                     1,
+                     target_x,
+                     target_y,
+                     180 + rnd(260))) return;
     if (!smooth_gaze(FACE_LISTENING, 1, target_x, target_y, 0, 0, 4)) return;
 
     if (rnd(3) == 0) natural_blink(FACE_LISTENING, 1, 0, 0);
@@ -181,8 +211,11 @@ static void speaking_sequence(void)
     else if (b < 42) target_y = -2;
 
     if (!smooth_gaze(FACE_SPEAKING, 2, 0, 0, target_x, target_y, 3)) return;
-    vTaskDelay(pdMS_TO_TICKS(500 + rnd(800)));
-    if (!state_ok(FACE_SPEAKING)) return;
+    if (!hold_render(FACE_SPEAKING,
+                     2,
+                     target_x,
+                     target_y,
+                     500 + rnd(800))) return;
 
     if (rnd(3) == 0) {
         natural_blink(FACE_SPEAKING, 2, target_x, target_y);
