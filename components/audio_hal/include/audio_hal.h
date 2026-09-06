@@ -29,6 +29,9 @@
 
 void audio_hal_init(void);
 
+// Initialize ESP-SR NSNet2 after WakeNet has loaded the shared model partition.
+void audio_hal_ns_init(void);
+
 void audio_i2s_test_tone(void);
 
 size_t audio_read_mic(uint8_t *dest, size_t max_len);
