@@ -141,7 +141,9 @@ static void audio_playback_task(void *arg)
 
         if (!playback_started && pending < AUDIO_PLAYBACK_PREBUFFER_SIZE &&
             audio_turn_active && !audio_turn_complete_pending) {
-            vTaskDelay(pdMS_TO_TICKS(5));
+            // Use one FreeRTOS tick, not pdMS_TO_TICKS(5), so this is guaranteed
+            // to yield even when the system tick is configured below 1 kHz.
+            vTaskDelay(1);
             continue;
         }
 
@@ -235,7 +237,7 @@ bool start_audio_playback(void)
     }
 
     BaseType_t result = xTaskCreatePinnedToCore(audio_playback_task, "audio_playback",
-                                                4096, NULL, 6,
+                                                4096, NULL, 3,
                                                 &audio_playback_task_handle, 1);
     if (result != pdPASS) {
         ESP_LOGE(TAG, "Gagal membuat audio_task/playback task: free_internal=%u largest=%u",
@@ -246,7 +248,7 @@ bool start_audio_playback(void)
         audio_playback_task_handle = NULL;
         return false;
     }
-    ESP_LOGI(TAG, "Audio ring buffer siap: %u byte, prebuffer=%u, target=%u B/s, playback core=1 priority=6",
+    ESP_LOGI(TAG, "Audio ring buffer siap: %u byte, prebuffer=%u, target=%u B/s, playback core=1 priority=3",
              (unsigned)AUDIO_RING_BUFFER_SIZE,
              (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE,
              (unsigned)AUDIO_OUTPUT_BYTES_PER_SEC);
