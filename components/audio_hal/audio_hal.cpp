@@ -117,7 +117,7 @@ void audio_hal_init(void)
     tx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO; tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
     tx_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT; tx_cfg.slot_cfg.ws_pol = false; tx_cfg.slot_cfg.bit_shift = true;
     tx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED; tx_cfg.gpio_cfg.bclk = SPK_I2S_BCLK; tx_cfg.gpio_cfg.ws = SPK_I2S_LRCK; tx_cfg.gpio_cfg.dout = SPK_I2S_DOUT; tx_cfg.gpio_cfg.din = I2S_GPIO_UNUSED;
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle)); ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
     log_audio_heap("after_i2s_init"); aec_init(); log_audio_heap("after_aec_init");
     ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT", MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
