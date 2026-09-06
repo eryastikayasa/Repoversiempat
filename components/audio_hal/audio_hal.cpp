@@ -213,7 +213,11 @@ void audio_write_speaker(const uint8_t *src, size_t len)
     const int16_t *pcm = reinterpret_cast<const int16_t *>(src);
     size_t total = len / sizeof(int16_t), offset = 0;
 
-    constexpr size_t I2S_WRITE_SAMPLES = 512;
+    // I2S write is blocking until the supplied buffer has been transmitted.
+    // Keeping this chunk at 240 samples limits the post-write AEC reference
+    // lag to about 10 ms at 24 kHz, matching Espressif's documented AEC
+    // recording/reference delay target of roughly 0-10 ms.
+    constexpr size_t I2S_WRITE_SAMPLES = 240;
     constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
 
     while (offset < total) {
