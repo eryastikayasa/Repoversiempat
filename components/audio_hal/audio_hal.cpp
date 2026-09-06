@@ -2,10 +2,13 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_aec.h"
+#include "esp_nsn_iface.h"
+#include "esp_nsn_models.h"
 #include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "model_path.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
@@ -23,6 +26,11 @@ static size_t aec_ref_read = 0;
 static size_t aec_ref_write = 0;
 static portMUX_TYPE aec_ref_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool aec_ready = false;
+
+static srmodel_list_t *ns_models = nullptr;
+static const esp_nsn_iface_t *ns_iface = nullptr;
+static esp_nsn_data_t *ns_data = nullptr;
+static bool ns_ready = false;
 
 static inline size_t aec_ref_count_locked(void) { return aec_ref_write - aec_ref_read; }
 
@@ -109,28 +117,87 @@ void audio_hal_init(void)
     tx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO; tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
     tx_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT; tx_cfg.slot_cfg.ws_pol = false; tx_cfg.slot_cfg.bit_shift = true;
     tx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED; tx_cfg.gpio_cfg.bclk = SPK_I2S_BCLK; tx_cfg.gpio_cfg.ws = SPK_I2S_LRCK; tx_cfg.gpio_cfg.dout = SPK_I2S_DOUT; tx_cfg.gpio_cfg.din = I2S_GPIO_UNUSED;
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_cfg));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle)); ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
     log_audio_heap("after_i2s_init"); aec_init(); log_audio_heap("after_aec_init");
     ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT", MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
 }
 
+void audio_hal_ns_init(void)
+{
+    if (ns_ready) return;
+
+    ns_models = esp_srmodel_init("model");
+    if (!ns_models) {
+        ESP_LOGE(TAG, "ESP-SR NSNet2 init gagal: model partition tidak tersedia");
+        return;
+    }
+
+    char *model_name = esp_srmodel_filter(ns_models, ESP_NSNET_PREFIX, NULL);
+    if (!model_name) {
+        ESP_LOGE(TAG, "ESP-SR NSNet model tidak ditemukan di srmodels.bin");
+        return;
+    }
+
+    ns_iface = esp_nsnet_handle_from_name(model_name);
+    if (!ns_iface) {
+        ESP_LOGE(TAG, "ESP-SR NSNet handle tidak ditemukan: %s", model_name);
+        return;
+    }
+
+    ns_data = ns_iface->create(model_name);
+    if (!ns_data) {
+        ESP_LOGE(TAG, "ESP-SR NSNet create gagal: %s", model_name);
+        ns_iface = nullptr;
+        return;
+    }
+
+    int chunk = ns_iface->get_samp_chunksize(ns_data);
+    int rate = ns_iface->get_samp_rate(ns_data);
+    if (chunk != (int)AEC_FRAME_SAMPLES || rate != MIC_SAMPLE_RATE) {
+        ESP_LOGE(TAG, "ESP-SR NSNet frame/rate tidak cocok: chunk=%d rate=%d expected=%u/%d", chunk, rate, (unsigned)AEC_FRAME_SAMPLES, MIC_SAMPLE_RATE);
+        ns_iface->destroy(ns_data);
+        ns_data = nullptr;
+        ns_iface = nullptr;
+        return;
+    }
+
+    ns_ready = true;
+    log_audio_heap("after_nsnet2_init");
+    ESP_LOGI(TAG, "ESP-SR NSNet2 READY: model=%s frame=%d rate=%dHz", model_name, chunk, rate);
+}
+
 size_t audio_read_mic(uint8_t *dest, size_t max_len)
 {
     if (!rx_handle || !dest || max_len < sizeof(int16_t)) return 0;
-    static int32_t raw[512]; static int16_t mic_frame[AEC_FRAME_SAMPLES]; static int16_t ref_frame[AEC_FRAME_SAMPLES]; static int16_t clean_frame[AEC_FRAME_SAMPLES];
+    static int32_t raw[512];
+    static int16_t mic_frame[AEC_FRAME_SAMPLES];
+    static int16_t ref_frame[AEC_FRAME_SAMPLES];
+    static int16_t clean_frame[AEC_FRAME_SAMPLES];
+    static int16_t ns_frame[AEC_FRAME_SAMPLES];
     size_t max_samples = max_len / sizeof(int16_t); if (max_samples > 512) max_samples = 512;
     size_t bytes_read = 0;
     if (i2s_channel_read(rx_handle, raw, max_samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) return 0;
     size_t samples = bytes_read / sizeof(int32_t); int16_t *pcm = reinterpret_cast<int16_t *>(dest);
     for (size_t i = 0; i < samples; ++i) pcm[i] = static_cast<int16_t>(raw[i] >> 16);
+
     if (aec_ready && samples == AEC_FRAME_SAMPLES) {
-        memcpy(mic_frame, pcm, sizeof(mic_frame)); aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES); aec_process(aec_handle, mic_frame, ref_frame, clean_frame); memcpy(pcm, clean_frame, sizeof(clean_frame));
+        memcpy(mic_frame, pcm, sizeof(mic_frame));
+        aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES);
+        aec_process(aec_handle, mic_frame, ref_frame, clean_frame);
+        memcpy(pcm, clean_frame, sizeof(clean_frame));
+    }
+
+    // ESP-SR NSNet2 runs after AEC so speaker reference handling is unchanged.
+    // It processes the same 512-sample / 32 ms frame used by the AEC path.
+    if (ns_ready && samples == AEC_FRAME_SAMPLES) {
+        ns_iface->process(ns_data, pcm, ns_frame);
+        memcpy(pcm, ns_frame, sizeof(ns_frame));
     }
 
     // Preserve the original mic/reference scale for AEC, then boost only the
-    // AEC-cleaned signal sent to Gemini. This raises far-field speech without
-    // changing echo-cancellation behavior.
+    // processed signal sent to Gemini. This raises far-field speech without
+    // changing echo-cancellation reference behavior.
     constexpr int MIC_OUTPUT_GAIN = 4; // +12 dB
     for (size_t i = 0; i < samples; ++i) {
         int32_t value = (int32_t)pcm[i] * MIC_OUTPUT_GAIN;
