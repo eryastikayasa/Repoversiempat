@@ -2,6 +2,7 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "esp_aec.h"
+#include "esp_heap_caps.h"
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -235,7 +236,7 @@ void audio_write_speaker(const uint8_t *src, size_t len)
 
 void audio_i2s_test_tone(void)
 {
-    static const int16_t sine_table[24] = {0,2071,4000,5657,6928,7727,8000,7727,6928,5657,4000,2071,0,-2071,-4000,-5657,-6928,-7727,-8000,-6928,-5657,-4000,-2071};
+    static const int16_t sine_table[24] = {0,2071,4000,5657,6928,7727,8000,7727,6928,5657,4000,2071,0,-2071,-4000,-5657,-6928,-7727,-8000,-7727,-6928,-5657,-4000,-2071};
     static int16_t tone[2400];
     if (!tx_handle) return;
     for (size_t i = 0; i < 2400; ++i) tone[i] = sine_table[i % 24];
