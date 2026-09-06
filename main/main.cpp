@@ -264,7 +264,10 @@ static bool mic_frame_has_activity(const uint8_t *data, size_t len)
         return false;
     }
 
-    constexpr int32_t SILENCE_THRESHOLD = 150;
+    // Local VAD is used only for activity bookkeeping. Gemini keeps its
+    // automatic VAD because the AEC-cleaned microphone stream is sent
+    // continuously. Lower threshold improves far-field activity detection.
+    constexpr int32_t SILENCE_THRESHOLD = 80;
     constexpr size_t MIN_ACTIVE_SAMPLES = 8;
     size_t active_samples = 0;
 
@@ -288,33 +291,118 @@ static int64_t connect_start_us = 0;
 
 static void audio_task(void *arg)
 {
-    (void)arg; static uint8_t audio_buffer[4096]; size_t buffer_pos = 0; uint32_t silent_frames = 0; int64_t last_silent_log_us = 0; static int64_t last_debug_us = 0; static int detect_calls = 0; static int last_wake_result = 0;
+    (void)arg;
+    static uint8_t audio_buffer[4096];
+    size_t buffer_pos = 0;
+    int64_t last_activity_debug_us = 0;
+    static int last_wake_result = 0;
+    static int detect_calls = 0;
+
     while (1) {
-        size_t bytes_read = audio_read_mic(audio_buffer + buffer_pos, sizeof(audio_buffer) - buffer_pos); if (bytes_read > 0) buffer_pos += bytes_read;
+        size_t bytes_read = audio_read_mic(audio_buffer + buffer_pos, sizeof(audio_buffer) - buffer_pos);
+        if (bytes_read > 0) buffer_pos += bytes_read;
+
         if (!assistant_active) {
             int64_t now_debug_us = esp_timer_get_time();
-            if (now_debug_us - last_debug_us >= 1000000) { last_debug_us = now_debug_us; int32_t max_abs = 0; size_t wake_bytes = (size_t)wake_chunk_samples * sizeof(int16_t); if (wake_chunk_samples > 0 && buffer_pos >= wake_bytes) { int16_t *pcm = reinterpret_cast<int16_t *>(audio_buffer); for (int i = 0; i < wake_chunk_samples; ++i) { int32_t val = pcm[i]; int32_t magnitude = val < 0 ? -val : val; if (magnitude > max_abs) max_abs = magnitude; } } ESP_LOGI("WAKE_DEBUG", "buffer_pos=%u max_abs=%ld detect_calls=%d last_result=%d chunk_samples=%d bytes_read=%u", (unsigned)buffer_pos, (long)max_abs, detect_calls, last_wake_result, wake_chunk_samples, (unsigned)bytes_read); }
-            while (wake_iface && wake_model && wake_chunk_samples > 0 && buffer_pos >= (size_t)wake_chunk_samples * sizeof(int16_t)) {
-                size_t wake_bytes = (size_t)wake_chunk_samples * sizeof(int16_t); int16_t *wake_pcm = reinterpret_cast<int16_t *>(audio_buffer); detect_calls++; int wake_result = wake_iface->detect(wake_model, wake_pcm); last_wake_result = wake_result;
-                if (wake_result > 0) { ESP_LOGW(TAG, ">>> WAKE WORD TERDETEKSI: HI, ESP (id=%d)", wake_result); assistant_active = true; connect_start_us = esp_timer_get_time(); last_user_activity_us = connect_start_us; face_set_state(FACE_HAPPY); websocket_app_start(); buffer_pos = 0; vTaskDelay(pdMS_TO_TICKS(10)); continue; }
-                size_t remainder = buffer_pos - wake_bytes; if (remainder > 0) memmove(audio_buffer, audio_buffer + wake_bytes, remainder); buffer_pos = remainder;
+            if (now_debug_us - last_activity_debug_us >= 1000000) {
+                last_activity_debug_us = now_debug_us;
+                int32_t max_abs = 0;
+                size_t wake_bytes = (size_t)wake_chunk_samples * sizeof(int16_t);
+                if (wake_chunk_samples > 0 && buffer_pos >= wake_bytes) {
+                    int16_t *pcm = reinterpret_cast<int16_t *>(audio_buffer);
+                    for (int i = 0; i < wake_chunk_samples; ++i) {
+                        int32_t val = pcm[i];
+                        int32_t magnitude = val < 0 ? -val : val;
+                        if (magnitude > max_abs) max_abs = magnitude;
+                    }
+                }
+                ESP_LOGI("WAKE_DEBUG", "buffer_pos=%u max_abs=%ld detect_calls=%d last_result=%d chunk_samples=%d bytes_read=%u",
+                         (unsigned)buffer_pos, (long)max_abs, detect_calls, last_wake_result,
+                         wake_chunk_samples, (unsigned)bytes_read);
             }
+
+            while (wake_iface && wake_model && wake_chunk_samples > 0 &&
+                   buffer_pos >= (size_t)wake_chunk_samples * sizeof(int16_t)) {
+                size_t wake_bytes = (size_t)wake_chunk_samples * sizeof(int16_t);
+                int16_t *wake_pcm = reinterpret_cast<int16_t *>(audio_buffer);
+                detect_calls++;
+                int wake_result = wake_iface->detect(wake_model, wake_pcm);
+                last_wake_result = wake_result;
+
+                if (wake_result > 0) {
+                    ESP_LOGW(TAG, ">>> WAKE WORD TERDETEKSI: HI, ESP (id=%d)", wake_result);
+                    assistant_active = true;
+                    connect_start_us = esp_timer_get_time();
+                    last_user_activity_us = connect_start_us;
+                    face_set_state(FACE_HAPPY);
+                    websocket_app_start();
+                    buffer_pos = 0;
+                    vTaskDelay(pdMS_TO_TICKS(10));
+                    continue;
+                }
+
+                size_t remainder = buffer_pos - wake_bytes;
+                if (remainder > 0) memmove(audio_buffer, audio_buffer + wake_bytes, remainder);
+                buffer_pos = remainder;
+            }
+
             if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
                 vTaskDelay(pdMS_TO_TICKS(50));
-                if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) { while (gpio_get_level(BOOT_BUTTON_GPIO) == 0) vTaskDelay(pdMS_TO_TICKS(10)); ESP_LOGI(TAG, "Tombol ditekan! Memulai sesi..."); assistant_active = true; connect_start_us = esp_timer_get_time(); last_user_activity_us = connect_start_us; face_set_state(FACE_HAPPY); websocket_app_start(); }
+                if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+                    while (gpio_get_level(BOOT_BUTTON_GPIO) == 0) vTaskDelay(pdMS_TO_TICKS(10));
+                    ESP_LOGI(TAG, "Tombol ditekan! Memulai sesi...");
+                    assistant_active = true;
+                    connect_start_us = esp_timer_get_time();
+                    last_user_activity_us = connect_start_us;
+                    face_set_state(FACE_HAPPY);
+                    websocket_app_start();
+                }
             }
-            vTaskDelay(pdMS_TO_TICKS(2)); continue;
+
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
         }
+
         if (!websocket_is_connected()) {
-            if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) { ESP_LOGW(TAG, "Koneksi gagal. Kembali ke mode sleep."); assistant_active = false; face_set_state(FACE_SLEEP); buffer_pos = 0; continue; }
-            buffer_pos = 0; vTaskDelay(pdMS_TO_TICKS(100)); continue;
+            if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) {
+                ESP_LOGW(TAG, "Koneksi gagal. Kembali ke mode sleep.");
+                assistant_active = false;
+                face_set_state(FACE_SLEEP);
+                buffer_pos = 0;
+                continue;
+            }
+            buffer_pos = 0;
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
         }
-        if (buffer_pos >= 3200) {
-            bool has_activity = mic_frame_has_activity(audio_buffer, 3200); if (has_activity) last_user_activity_us = esp_timer_get_time(); int64_t now_us = esp_timer_get_time();
-            if (now_us - last_user_activity_us > 60 * 1000000LL) { ESP_LOGI(TAG, "Idle 60 detik, menutup sesi."); assistant_active = false; face_set_state(FACE_SLEEP); websocket_disconnect(); buffer_pos = 0; continue; }
-            if (has_activity) { websocket_send_audio_data(audio_buffer, 3200); } else { silent_frames++; int64_t now_log = esp_timer_get_time(); if (last_silent_log_us == 0 || now_log - last_silent_log_us >= 1000000) { last_silent_log_us = now_log; ESP_LOGI(TAG, "V7.0.37 MIC TX: silent frames dropped=%lu", (unsigned long)silent_frames); } }
-            size_t remainder = buffer_pos - 3200; if (remainder > 0) memmove(audio_buffer, audio_buffer + 3200, remainder); buffer_pos = remainder;
+
+        // Gemini Live receives the AEC-cleaned microphone continuously.
+        // 640 bytes = 320 samples = 20 ms at 16 kHz. The TX worker may split
+        // the command further as needed, while the server-side AAD handles
+        // speech start/end detection. This avoids the old 100 ms local gate
+        // that discarded quiet/far-field speech before Gemini could see it.
+        constexpr size_t GEMINI_MIC_CHUNK_BYTES = 640;
+        while (buffer_pos >= GEMINI_MIC_CHUNK_BYTES) {
+            bool has_activity = mic_frame_has_activity(audio_buffer, GEMINI_MIC_CHUNK_BYTES);
+            if (has_activity) last_user_activity_us = esp_timer_get_time();
+
+            int64_t now_us = esp_timer_get_time();
+            if (now_us - last_user_activity_us > 60 * 1000000LL) {
+                ESP_LOGI(TAG, "Idle 60 detik, menutup sesi.");
+                assistant_active = false;
+                face_set_state(FACE_SLEEP);
+                websocket_disconnect();
+                buffer_pos = 0;
+                break;
+            }
+
+            websocket_send_audio_data(audio_buffer, GEMINI_MIC_CHUNK_BYTES);
+
+            size_t remainder = buffer_pos - GEMINI_MIC_CHUNK_BYTES;
+            if (remainder > 0) memmove(audio_buffer, audio_buffer + GEMINI_MIC_CHUNK_BYTES, remainder);
+            buffer_pos = remainder;
         }
+
         vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
