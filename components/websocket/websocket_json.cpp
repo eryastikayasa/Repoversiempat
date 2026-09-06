@@ -137,7 +137,6 @@ static void add_device_control_tool(cJSON *setup)
         "mp3_mode", "mp3_play", "mp3_eq",
         "m_led", "m_mute", "m_musik", "m_cek",
         "cek_suhu", "cek_cahaya",
-        // Gemini Face commands
         "face_idle",
         "face_listening",
         "face_thinking",
@@ -203,19 +202,23 @@ bool build_gemini_setup(char **output, size_t *output_len)
     cJSON_AddItemToArray(system_parts, system_text);
     static char role_text[512];
 
-if (web_config_load_role(role_text, sizeof(role_text)) &&
-    role_text[0] != '\0') {
-    cJSON *role_part = cJSON_CreateObject();
-    if (role_part) {
-        cJSON_AddStringToObject(role_part, "text", role_text);
-        cJSON_AddItemToArray(system_parts, role_part);
+    if (web_config_load_role(role_text, sizeof(role_text)) &&
+        role_text[0] != '\0') {
+        cJSON *role_part = cJSON_CreateObject();
+        if (role_part) {
+            cJSON_AddStringToObject(role_part, "text", role_text);
+            cJSON_AddItemToArray(system_parts, role_part);
+        }
     }
-}
     add_device_control_tool(setup);
 
     cJSON *realtime = cJSON_AddObjectToObject(setup, "realtimeInputConfig");
     cJSON *aad = cJSON_AddObjectToObject(realtime, "automaticActivityDetection");
     cJSON_AddBoolToObject(aad, "disabled", false);
+    cJSON_AddStringToObject(aad, "startOfSpeechSensitivity", "START_SENSITIVITY_HIGH");
+    cJSON_AddNumberToObject(aad, "prefixPaddingMs", 40);
+    cJSON_AddStringToObject(aad, "endOfSpeechSensitivity", "END_SENSITIVITY_HIGH");
+    cJSON_AddNumberToObject(aad, "silenceDurationMs", 500);
     cJSON *resumption = cJSON_AddObjectToObject(setup, "sessionResumption");
     if (session_resumable && session_handle[0] != '\0')
         cJSON_AddStringToObject(resumption, "handle", session_handle);
@@ -227,7 +230,7 @@ if (web_config_load_role(role_text, sizeof(role_text)) &&
     }
     *output = json;
     *output_len = strlen(json);
-    ESP_LOGI(TAG, "Gemini setup V7.0.9: AUDIO + id-ID + AAD ENABLED + UART TOOL");
+    ESP_LOGI(TAG, "Gemini setup: AUDIO + id-ID + AAD HIGH + prefix=40ms + silence=500ms + UART TOOL");
     return true;
 }
 
