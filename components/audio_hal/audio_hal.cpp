@@ -1,14 +1,115 @@
 #include "audio_hal.h"
 #include "esp_log.h"
 #include "esp_err.h"
+#include "esp_aec.h"
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 
 static const char *TAG = "AUDIO_HAL";
 static i2s_chan_handle_t rx_handle = NULL;
 static i2s_chan_handle_t tx_handle = NULL;
+
+// ESP-SR AEC works at 16 kHz. The speaker path is 24 kHz, so a small
+// real-time 24k -> 16k reference queue is maintained from the samples that
+// are actually written to the I2S speaker. This gives AEC the far-end signal
+// at the acoustic output boundary instead of the still-buffered Gemini PCM.
+constexpr size_t AEC_FRAME_SAMPLES = 512;       // 32 ms @ 16 kHz
+constexpr size_t AEC_REF_RING_SAMPLES = 32768;  // ~2.0 s @ 16 kHz
+
+static aec_handle_t *aec_handle = NULL;
+static int16_t aec_ref_ring[AEC_REF_RING_SAMPLES];
+static volatile size_t aec_ref_read = 0;
+static volatile size_t aec_ref_write = 0;
+static portMUX_TYPE aec_ref_mux = portMUX_INITIALIZER_UNLOCKED;
+static bool aec_ready = false;
+
+static inline size_t aec_ref_count_locked(void)
+{
+    return aec_ref_write - aec_ref_read;
+}
+
+static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
+{
+    if (!pcm || samples == 0) return;
+
+    // 24 kHz -> 16 kHz, exact 2/3 rate. A simple phase-locked sample
+    // selection is sufficient for the AEC reference because the AEC filter
+    // adapts to the acoustic path; it avoids adding another large resampler.
+    static uint32_t phase = 0;
+    constexpr uint32_t STEP = 2;
+    constexpr uint32_t DEN = 3;
+
+    portENTER_CRITICAL(&aec_ref_mux);
+    for (size_t i = 0; i < samples; ++i) {
+        phase += STEP;
+        if (phase >= DEN) {
+            phase -= DEN;
+            size_t next = aec_ref_write % AEC_REF_RING_SAMPLES;
+            aec_ref_ring[next] = pcm[i];
+            ++aec_ref_write;
+            if (aec_ref_count_locked() > AEC_REF_RING_SAMPLES) {
+                aec_ref_read = aec_ref_write - AEC_REF_RING_SAMPLES;
+            }
+        }
+    }
+    portEXIT_CRITICAL(&aec_ref_mux);
+}
+
+static void aec_ref_pop(int16_t *dest, size_t samples)
+{
+    if (!dest || samples == 0) return;
+
+    portENTER_CRITICAL(&aec_ref_mux);
+    size_t available = aec_ref_count_locked();
+    size_t take = available < samples ? available : samples;
+    for (size_t i = 0; i < take; ++i) {
+        dest[i] = aec_ref_ring[(aec_ref_read + i) % AEC_REF_RING_SAMPLES];
+    }
+    aec_ref_read += take;
+    portEXIT_CRITICAL(&aec_ref_mux);
+
+    if (take < samples) {
+        memset(dest + take, 0, (samples - take) * sizeof(int16_t));
+    }
+}
+
+static void aec_init(void)
+{
+    aec_config_t config = {};
+    config.mic_num = 1;
+    config.ref_num = 1;
+    config.out_num = 1;
+    config.filter_length = 4;
+    config.sample_rate = MIC_SAMPLE_RATE;
+    config.caps = MALLOC_CAP_PSRAM | MALLOC_CAP_8BIT;
+    config.mode = AEC_MODE_FD_LOW_COST;
+    config.nlp_level = AEC_NLP_LEVEL_NORMAL;
+
+    aec_handle = aec_create_from_config(&config);
+    if (!aec_handle) {
+        ESP_LOGE(TAG, "ESP-SR AEC init gagal - MIC akan tetap berjalan tanpa AEC");
+        aec_ready = false;
+        return;
+    }
+
+    int frame = aec_get_chunksize(aec_handle);
+    if (frame != (int)AEC_FRAME_SAMPLES) {
+        ESP_LOGE(TAG, "ESP-SR AEC frame tidak cocok: %d, expected=%u", frame, (unsigned)AEC_FRAME_SAMPLES);
+        aec_destroy(aec_handle);
+        aec_handle = NULL;
+        aec_ready = false;
+        return;
+    }
+
+    aec_ready = true;
+    ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s",
+             aec_get_mode_string(config.mode), frame, config.sample_rate,
+             config.filter_length, aec_get_nlp_string(config.nlp_level));
+}
 
 void audio_hal_init(void)
 {
@@ -43,18 +144,36 @@ void audio_hal_init(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
     ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
-    ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT", MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
+
+    aec_init();
+    ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT",
+             MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
 }
 
 size_t audio_read_mic(uint8_t *dest, size_t max_len)
 {
     if (!rx_handle || !dest || max_len < sizeof(int16_t)) return 0;
     static int32_t raw[512];
+    static int16_t mic_frame[AEC_FRAME_SAMPLES];
+    static int16_t ref_frame[AEC_FRAME_SAMPLES];
+    static int16_t clean_frame[AEC_FRAME_SAMPLES];
+
     size_t max_samples = max_len / sizeof(int16_t); if (max_samples > 512) max_samples = 512;
     size_t bytes_read = 0;
     if (i2s_channel_read(rx_handle, raw, max_samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) return 0;
-    size_t samples = bytes_read / sizeof(int32_t); int16_t *pcm = reinterpret_cast<int16_t *>(dest);
+    size_t samples = bytes_read / sizeof(int32_t);
+    int16_t *pcm = reinterpret_cast<int16_t *>(dest);
     for (size_t i = 0; i < samples; ++i) pcm[i] = static_cast<int16_t>(raw[i] >> 16);
+
+    // audio_task normally receives a full 512-sample frame. Only invoke AEC
+    // when the complete frame is available; partial frames remain untouched.
+    if (aec_ready && samples == AEC_FRAME_SAMPLES) {
+        memcpy(mic_frame, pcm, sizeof(mic_frame));
+        aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES);
+        aec_process(aec_handle, mic_frame, ref_frame, clean_frame);
+        memcpy(pcm, clean_frame, sizeof(clean_frame));
+    }
+
     return samples * sizeof(int16_t);
 }
 
@@ -63,6 +182,7 @@ void audio_write_speaker(const uint8_t *src, size_t len)
     if (!tx_handle || !src || len < 2) return;
     len &= ~((size_t)1);
     static int32_t tx_buffer[1024];
+    static int16_t ref_pcm[512];
     const int16_t *pcm = reinterpret_cast<const int16_t *>(src);
     size_t total = len / sizeof(int16_t), offset = 0;
 
@@ -98,25 +218,24 @@ void audio_write_speaker(const uint8_t *src, size_t len)
             ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums",
                      esp_err_to_name(err), (unsigned)written,
                      (unsigned)(n * sizeof(int32_t)), (unsigned)I2S_WRITE_TIMEOUT_MS);
-            /* Give CPU1's lower-priority idle task a real scheduling window
-             * before returning from a stalled DMA path. */
             vTaskDelay(1);
             return;
         }
 
-        /*
-         * v7.0.34 scheduler yield:
-         * Never let a long sequence of successful audio writes monopolize
-         * CPU1. This is a scheduling change only; I2S timing/format remains
-         * exactly the v6.1.5 locked baseline.
-         */
+        // Feed the exact samples that just reached the I2S write boundary to
+        // the AEC reference path. The AEC consumer runs from the MIC task.
+        if (aec_ready) {
+            for (size_t i = 0; i < n; ++i) ref_pcm[i] = pcm[offset - n + i];
+            aec_ref_push_24k(ref_pcm, n);
+        }
+
         vTaskDelay(1);
     }
 }
 
 void audio_i2s_test_tone(void)
 {
-    static const int16_t sine_table[24] = {0,2071,4000,5657,6928,7727,8000,7727,6928,5657,4000,2071,0,-2071,-4000,-5657,-6928,-7727,-8000,-7727,-6928,-5657,-4000,-2071};
+    static const int16_t sine_table[24] = {0,2071,4000,5657,6928,7727,8000,7727,6928,5657,4000,2071,0,-2071,-4000,-5657,-6928,-7727,-8000,-6928,-5657,-4000,-2071};
     static int16_t tone[2400];
     if (!tx_handle) return;
     for (size_t i = 0; i < 2400; ++i) tone[i] = sine_table[i % 24];
