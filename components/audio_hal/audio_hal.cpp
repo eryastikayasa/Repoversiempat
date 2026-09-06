@@ -153,9 +153,8 @@ void audio_hal_ns_init(void)
     }
 
     int chunk = ns_iface->get_samp_chunksize(ns_data);
-    int rate = ns_iface->get_samp_rate(ns_data);
-    if (chunk != (int)AEC_FRAME_SAMPLES || rate != MIC_SAMPLE_RATE) {
-        ESP_LOGE(TAG, "ESP-SR NSNet frame/rate tidak cocok: chunk=%d rate=%d expected=%u/%d", chunk, rate, (unsigned)AEC_FRAME_SAMPLES, MIC_SAMPLE_RATE);
+    if (chunk != (int)AEC_FRAME_SAMPLES) {
+        ESP_LOGE(TAG, "ESP-SR NSNet frame tidak cocok: chunk=%d expected=%u", chunk, (unsigned)AEC_FRAME_SAMPLES);
         ns_iface->destroy(ns_data);
         ns_data = nullptr;
         ns_iface = nullptr;
@@ -164,7 +163,7 @@ void audio_hal_ns_init(void)
 
     ns_ready = true;
     log_audio_heap("after_nsnet2_init");
-    ESP_LOGI(TAG, "ESP-SR NSNet2 READY: model=%s frame=%d rate=%dHz", model_name, chunk, rate);
+    ESP_LOGI(TAG, "ESP-SR NSNet2 READY: model=%s frame=%d rate=%dHz", model_name, chunk, MIC_SAMPLE_RATE);
 }
 
 size_t audio_read_mic(uint8_t *dest, size_t max_len)
