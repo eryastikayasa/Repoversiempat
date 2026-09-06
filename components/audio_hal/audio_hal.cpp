@@ -249,8 +249,6 @@ void audio_write_speaker(const uint8_t *src, size_t len)
             vTaskDelay(1);
             return;
         }
-
-        vTaskDelay(1);
     }
 }
 
