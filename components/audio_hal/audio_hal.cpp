@@ -213,7 +213,11 @@ void audio_write_speaker(const uint8_t *src, size_t len)
     const int16_t *pcm = reinterpret_cast<const int16_t *>(src);
     size_t total = len / sizeof(int16_t), offset = 0;
 
-    constexpr size_t I2S_WRITE_SAMPLES = 512;
+    // Keep each blocking TX write at one 10 ms DMA frame. ESP-SR notes that
+    // its AEC internal buffering expects the recording signal to be only
+    // about 0-10 ms behind the playback reference. The previous 512-sample
+    // writes were 21.3 ms at 24 kHz, making the software reference too late.
+    constexpr size_t I2S_WRITE_SAMPLES = 240;
     constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
 
     while (offset < total) {
@@ -245,8 +249,6 @@ void audio_write_speaker(const uint8_t *src, size_t len)
             vTaskDelay(1);
             return;
         }
-
-        vTaskDelay(1);
     }
 }
 
