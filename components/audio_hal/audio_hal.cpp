@@ -29,8 +29,8 @@ constexpr size_t AEC_REF_MAX_DELAY_SAMPLES = (MIC_SAMPLE_RATE * AEC_REF_MAX_DELA
 constexpr size_t SPK_DMA_SAMPLES_PER_BUFFER = 240;
 static aec_handle_t *aec_handle = NULL;
 static int16_t *aec_ref_ring = nullptr;
-static size_t aec_ref_read = 0;
-static size_t aec_ref_write = 0;
+static volatile size_t aec_ref_read = 0;
+static volatile size_t aec_ref_write = 0;
 static size_t aec_ref_last_target_end = 0;
 static size_t aec_ref_delay_samples = AEC_REF_INITIAL_DELAY_SAMPLES;
 static portMUX_TYPE aec_ref_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -138,11 +138,7 @@ static size_t aec_ref_current_playback_16k(void)
         }
     }
 
-    size_t submitted_16k;
-    portENTER_CRITICAL(&aec_ref_mux);
-    submitted_16k = aec_ref_write;
-    portEXIT_CRITICAL(&aec_ref_mux);
-
+    const size_t submitted_16k = aec_ref_write;
     const uint64_t estimated_16k = (estimated_24k * MIC_SAMPLE_RATE) / SPK_SAMPLE_RATE;
     return estimated_16k > submitted_16k ? submitted_16k : (size_t)estimated_16k;
 }
@@ -153,9 +149,9 @@ static void aec_ref_pop(int16_t *dest, size_t samples)
     memset(dest, 0, samples * sizeof(int16_t));
     if (!aec_ref_ring) return;
 
+    const size_t playback_pos = aec_ref_current_playback_16k();
     portENTER_CRITICAL(&aec_ref_mux);
     const size_t write_pos = aec_ref_write;
-    const size_t playback_pos = aec_ref_current_playback_16k();
     const size_t delay_samples = aec_ref_delay_samples;
     const size_t available_end = playback_pos > delay_samples ? playback_pos - delay_samples : 0;
     if (available_end > aec_ref_last_target_end) {
@@ -257,7 +253,6 @@ static void aec_log_frame_levels(const int16_t *mic, const int16_t *ref, const i
 
     size_t ring_count, delay_samples;
     uint64_t dma_completed_24k;
-    int64_t dma_last_sent_us;
     uint32_t dma_callbacks;
     portENTER_CRITICAL(&aec_ref_mux);
     ring_count = aec_ref_count_locked();
@@ -265,7 +260,6 @@ static void aec_log_frame_levels(const int16_t *mic, const int16_t *ref, const i
     portEXIT_CRITICAL(&aec_ref_mux);
     portENTER_CRITICAL(&tx_dma_mux);
     dma_completed_24k = tx_dma_completed_24k;
-    dma_last_sent_us = tx_dma_last_sent_us;
     dma_callbacks = tx_dma_callbacks;
     portEXIT_CRITICAL(&tx_dma_mux);
     const size_t playback_16k = aec_ref_current_playback_16k();
@@ -277,7 +271,6 @@ static void aec_log_frame_levels(const int16_t *mic, const int16_t *ref, const i
              mic_sum ? (unsigned)((clean_sum * 1000ULL) / mic_sum) : 0,
              (unsigned)ring_count, (unsigned)playback_16k, (unsigned)dma_completed_24k,
              (unsigned)dma_callbacks, (unsigned)((delay_samples * 1000) / MIC_SAMPLE_RATE));
-    (void)dma_last_sent_us;
 }
 
 static void aec_log_alignment_and_adapt(const int16_t *mic, const int16_t *ref, size_t samples)
@@ -519,8 +512,8 @@ void audio_write_speaker(const uint8_t *src, size_t len)
         if (samples_written > n) samples_written = n;
         offset += samples_written;
 
-        // Reference content follows the exact PCM that i2s_channel_write
-        // accepted. DMA timing is tracked independently by tx_dma_on_sent().
+        // Reference content follows exactly the PCM accepted by I2S.
+        // Playback timing is independently anchored by tx_dma_on_sent().
         if (samples_written > 0) {
             aec_ref_push_24k(pcm + old_offset, samples_written);
         }
