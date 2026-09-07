@@ -19,12 +19,14 @@ static StaticSemaphore_t audio_send_mutex_storage;
 static SemaphoreHandle_t audio_send_mutex = NULL;
 #define AUDIO_OUTPUT_SAMPLE_RATE 24000U
 #define AUDIO_OUTPUT_BYTES_PER_SEC (AUDIO_OUTPUT_SAMPLE_RATE * 2U)
-#define AUDIO_RING_BUFFER_SIZE (512 * 1024)
-#define AUDIO_PLAYBACK_PREBUFFER_SIZE (32 * 1024)
-#define AUDIO_PLAYBACK_READ_SIZE 2048
+#define AUDIO_RING_BUFFER_SIZE 32768U
+#define AUDIO_PLAYBACK_PREBUFFER_SIZE 9600U
+#define AUDIO_PLAYBACK_WARNING_SIZE 4800U
+#define AUDIO_PLAYBACK_CRITICAL_SIZE 2400U
+#define AUDIO_PLAYBACK_READ_SIZE 2048U
 #define AUDIO_PLAYBACK_READ_WAIT_MS 5
-#define AUDIO_PLAYBACK_TRIGGER_SIZE 1024
-#define AUDIO_SEND_CHUNK_SIZE 512
+#define AUDIO_PLAYBACK_TRIGGER_SIZE 1024U
+#define AUDIO_SEND_CHUNK_SIZE 512U
 #define AUDIO_SEND_WAIT_MS 50
 static volatile uint32_t audio_turn_generation = 0;
 static size_t send_realtime_pcm(const uint8_t *data, size_t len)
@@ -73,9 +75,10 @@ static void audio_playback_task(void *arg)
     static uint8_t playback_buffer[AUDIO_PLAYBACK_READ_SIZE];
     bool playback_started = false;
     bool underrun_reported = false;
+    uint8_t buffer_level = 0;
     uint32_t playback_generation = 0;
     int64_t last_stats_us = 0;
-    ESP_LOGI(TAG, "Audio playback task: 24kHz PCM16 mono, ring=%u, prebuffer=%u, core=%d priority=3", (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE, xPortGetCoreID());
+    ESP_LOGI(TAG, "Audio playback task: 24kHz PCM16 mono, ring=%u, prebuffer=%u (200ms), warning=%u (100ms), critical=%u (50ms), read=%u, core=%d priority=3", (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_WARNING_SIZE, (unsigned)AUDIO_PLAYBACK_CRITICAL_SIZE, (unsigned)AUDIO_PLAYBACK_READ_SIZE, xPortGetCoreID());
     for (;;) {
         if (audio_clear_pending) {
             audio_clear_pending = false;
@@ -94,6 +97,7 @@ static void audio_playback_task(void *arg)
             audio_turn_active = false;
             playback_started = false;
             underrun_reported = false;
+            buffer_level = 0;
             playback_generation = audio_turn_generation;
         }
         uint32_t current_generation = audio_turn_generation;
@@ -101,9 +105,22 @@ static void audio_playback_task(void *arg)
             playback_generation = current_generation;
             playback_started = false;
             underrun_reported = false;
+            buffer_level = 0;
         }
         if (audio_stream == NULL) { vTaskDelay(pdMS_TO_TICKS(100)); continue; }
         size_t pending = xStreamBufferBytesAvailable(audio_stream);
+        if (audio_turn_active) {
+            uint8_t new_level;
+            if (pending == 0) new_level = 0;
+            else if (pending < AUDIO_PLAYBACK_CRITICAL_SIZE) new_level = 1;
+            else if (pending < AUDIO_PLAYBACK_WARNING_SIZE) new_level = 2;
+            else new_level = 3;
+            if (new_level != buffer_level) {
+                buffer_level = new_level;
+                if (new_level == 1) ESP_LOGW(TAG, "AUDIO BUFFER CRITICAL: pending=%u B (~%u ms)", (unsigned)pending, (unsigned)((pending * 1000U) / AUDIO_OUTPUT_BYTES_PER_SEC));
+                else if (new_level == 2) ESP_LOGW(TAG, "AUDIO BUFFER WARNING: pending=%u B (~%u ms)", (unsigned)pending, (unsigned)((pending * 1000U) / AUDIO_OUTPUT_BYTES_PER_SEC));
+            }
+        }
         if (!playback_started && pending < AUDIO_PLAYBACK_PREBUFFER_SIZE && audio_turn_active && !audio_turn_complete_pending) { vTaskDelay(1); continue; }
         if (playback_started && pending == 0 && audio_turn_active && !audio_turn_complete_pending) {
             if (!underrun_reported) {
@@ -111,6 +128,7 @@ static void audio_playback_task(void *arg)
                 underrun_reported = true;
             }
             playback_started = false;
+            buffer_level = 0;
             vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAYBACK_READ_WAIT_MS));
             continue;
         }
@@ -129,7 +147,7 @@ static void audio_playback_task(void *arg)
             last_stats_us = now_us;
             ESP_LOGI(TAG, "AUDIO FLOW: pending=%u/%u received=%llu queued=%llu played=%llu dropped=%llu", (unsigned)xStreamBufferBytesAvailable(audio_stream), (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned long long)audio_bytes_received, (unsigned long long)audio_bytes_queued, (unsigned long long)audio_bytes_played, (unsigned long long)audio_bytes_dropped);
         }
-        if (!audio_turn_active && xStreamBufferBytesAvailable(audio_stream) == 0) { playback_started = false; underrun_reported = false; }
+        if (!audio_turn_active && xStreamBufferBytesAvailable(audio_stream) == 0) { playback_started = false; underrun_reported = false; buffer_level = 0; }
     }
 }
 bool start_audio_playback(void)
@@ -156,7 +174,7 @@ bool start_audio_playback(void)
         audio_playback_task_handle = NULL;
         return false;
     }
-    ESP_LOGI(TAG, "Audio ring buffer siap: %u byte, prebuffer=%u, target=%u B/s, playback core=1 priority=3", (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE, (unsigned)AUDIO_OUTPUT_BYTES_PER_SEC);
+    ESP_LOGI(TAG, "Audio ring buffer siap: %u byte, prebuffer=%u (200ms), warning=%u (100ms), critical=%u (50ms), target=%u B/s, playback core=1 priority=3", (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_WARNING_SIZE, (unsigned)AUDIO_PLAYBACK_CRITICAL_SIZE, (unsigned)AUDIO_OUTPUT_BYTES_PER_SEC);
     return true;
 }
 
