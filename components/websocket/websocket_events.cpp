@@ -20,6 +20,37 @@ static void invalidate_connection_generation(void)
              (unsigned long)websocket_connection_generation);
 }
 
+static void log_close_diagnostics(const char *event_name, const esp_websocket_event_data_t *data)
+{
+    if (!data) {
+        ESP_LOGW(TAG, "%s: event_data=NULL close_status=0", event_name);
+        return;
+    }
+
+    ESP_LOGW(TAG,
+             "%s: close_status_code=%d (0x%04X) data_len=%d payload_len=%d payload_offset=%d opcode=0x%02X fin=%d",
+             event_name,
+             (int)data->close_status_code,
+             (unsigned)((uint16_t)data->close_status_code),
+             (int)data->data_len,
+             (int)data->payload_len,
+             (int)data->payload_offset,
+             (unsigned)data->op_code,
+             data->fin ? 1 : 0);
+
+    if (data->data_ptr && data->data_len > 0) {
+        size_t n = (size_t)data->data_len;
+        if (n > 96) n = 96;
+        char preview[97];
+        for (size_t i = 0; i < n; ++i) {
+            unsigned char c = (unsigned char)data->data_ptr[i];
+            preview[i] = (c >= 32 && c <= 126) ? (char)c : '.';
+        }
+        preview[n] = '\0';
+        ESP_LOGW(TAG, "%s: close/data preview=%s", event_name, preview);
+    }
+}
+
 void websocket_event_handler(void *handler_args, esp_event_base_t base,
                              int32_t event_id, void *event_data)
 {
@@ -58,12 +89,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             if (!is_connected || websocket_tx_error) break;
             if (data->op_code == 0x08) {
                 ESP_LOGW(TAG, "GEMINI CLOSE FRAME");
-                if (data->data_ptr && data->data_len >= 2) {
-                    uint16_t code = ((uint8_t)data->data_ptr[0] << 8) |
-                                    (uint8_t)data->data_ptr[1];
-                    ESP_LOGW(TAG, "CLOSE CODE: %u (0x%04X)",
-                             (unsigned)code, (unsigned)code);
-                }
+                log_close_diagnostics("CLOSE_FRAME", data);
                 break;
             }
             if ((data->op_code == 0x00 || data->op_code == 0x01 || data->op_code == 0x02) &&
@@ -77,12 +103,14 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             if (data) {
                 ESP_LOGE(TAG,
                          "WS error_type=%d sock_errno=%d tls_esp_err=0x%x "
-                         "tls_stack_err=0x%x handshake=%d",
+                         "tls_stack_err=0x%x handshake=%d close_status=%d",
                          (int)data->error_handle.error_type,
                          data->error_handle.esp_transport_sock_errno,
                          (unsigned)data->error_handle.esp_tls_last_esp_err,
                          (unsigned)data->error_handle.esp_tls_stack_err,
-                         data->error_handle.esp_ws_handshake_status_code);
+                         data->error_handle.esp_ws_handshake_status_code,
+                         (int)data->close_status_code);
+                log_close_diagnostics("ERROR", data);
             }
             is_connected = false;
             setup_complete = false;
@@ -101,6 +129,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
 
         case WEBSOCKET_EVENT_DISCONNECTED:
             ESP_LOGW(TAG, "WebSocket TERPUTUS dari Gemini");
+            log_close_diagnostics("DISCONNECTED", data);
             is_connected = false;
             setup_complete = false;
             websocket_tx_error = true;
@@ -117,6 +146,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
 
         case WEBSOCKET_EVENT_CLOSED:
             ESP_LOGW(TAG, "WebSocket CLOSED");
+            log_close_diagnostics("CLOSED", data);
             is_connected = false;
             setup_complete = false;
             websocket_tx_error = true;
@@ -130,6 +160,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
 
         case WEBSOCKET_EVENT_FINISH:
             ESP_LOGI(TAG, "WebSocket FINISH");
+            log_close_diagnostics("FINISH", data);
             /* FINISH is the hand-off point: the websocket task has finished
              * its lifecycle. A separate manager task may now destroy client. */
             websocket_finish_received = true;
