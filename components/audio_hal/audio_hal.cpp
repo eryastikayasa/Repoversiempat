@@ -22,11 +22,11 @@ static i2s_chan_handle_t rx_handle = NULL;
 static i2s_chan_handle_t tx_handle = NULL;
 constexpr size_t AEC_FRAME_SAMPLES = 512;
 constexpr size_t AEC_REF_RING_SAMPLES = 32768;
-constexpr size_t PA_REF_CAPTURE_RING_SAMPLES = 8192;
 constexpr size_t AEC_REF_INITIAL_DELAY_MS = 5;
 constexpr size_t AEC_REF_MAX_DELAY_MS = 20;
 constexpr size_t AEC_REF_INITIAL_DELAY_SAMPLES = (MIC_SAMPLE_RATE * AEC_REF_INITIAL_DELAY_MS) / 1000;
 constexpr size_t AEC_REF_MAX_DELAY_SAMPLES = (MIC_SAMPLE_RATE * AEC_REF_MAX_DELAY_MS) / 1000;
+constexpr size_t SPK_DMA_SAMPLES_PER_BUFFER = 240;
 static aec_handle_t *aec_handle = NULL;
 static int16_t *aec_ref_ring = nullptr;
 static size_t aec_ref_read = 0;
@@ -35,13 +35,12 @@ static size_t aec_ref_last_target_end = 0;
 static size_t aec_ref_delay_samples = AEC_REF_INITIAL_DELAY_SAMPLES;
 static portMUX_TYPE aec_ref_mux = portMUX_INITIALIZER_UNLOCKED;
 
-// This ring is fed only by the I2S TX on_sent ISR. It therefore follows the
-// actual DMA playback timeline, not the WebSocket arrival timeline.
-static int16_t pa_ref_capture_ring[PA_REF_CAPTURE_RING_SAMPLES];
-static volatile size_t pa_ref_capture_read = 0;
-static volatile size_t pa_ref_capture_write = 0;
-static volatile uint32_t pa_ref_capture_overruns = 0;
-static portMUX_TYPE pa_ref_capture_mux = portMUX_INITIALIZER_UNLOCKED;
+// Reference CONTENT is copied from PCM submitted to the speaker path.
+// DMA playback POSITION is tracked independently by on_sent().
+static volatile uint64_t tx_dma_completed_24k = 0;
+static volatile int64_t tx_dma_last_sent_us = 0;
+static volatile uint32_t tx_dma_callbacks = 0;
+static portMUX_TYPE tx_dma_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static bool aec_ready = false;
 static srmodel_list_t *ns_models = nullptr;
@@ -59,9 +58,8 @@ static void aec_ref_push_16k_sample(int16_t sample)
     if (aec_ref_count_locked() > AEC_REF_RING_SAMPLES) aec_ref_read = aec_ref_write - AEC_REF_RING_SAMPLES;
 }
 
-// Stateful 24 kHz -> 16 kHz linear interpolation. The state survives DMA
-// descriptor boundaries, so the reference waveform does not jump at each
-// 240-sample TX DMA block.
+// Stateful 24 kHz -> 16 kHz linear interpolation. Reference content is
+// created when PCM is accepted by the speaker path, not when DMA completes.
 static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
 {
     if (!pcm || samples == 0 || !aec_ref_ring) return;
@@ -97,54 +95,56 @@ static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
     portEXIT_CRITICAL(&aec_ref_mux);
 }
 
-// on_sent runs when a TX DMA buffer has just finished transmitting. The
-// callback is ISR context, so it does only a bounded copy into an internal
-// SRAM ring. Heavy resampling is deliberately deferred to task context.
-static bool IRAM_ATTR pa_ref_capture_on_sent(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx)
+// on_sent is intentionally NOT the reference source. It only anchors the
+// actual DMA playback position. ESP-IDF reports the DMA buffer that just
+// finished, so this callback advances the physical playback cursor by the
+// transmitted sample count and records its timestamp. The callback remains
+// lightweight because it runs in ISR context.
+static bool IRAM_ATTR tx_dma_on_sent(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx)
 {
     (void)handle;
     (void)user_ctx;
-    if (!event || !event->dma_buf || event->size < sizeof(int32_t)) return false;
+    if (!event || event->size < sizeof(int32_t)) return false;
 
-    const int32_t *dma = static_cast<const int32_t *>(event->dma_buf);
-    size_t samples = event->size / sizeof(int32_t);
-    if (samples > PA_REF_CAPTURE_RING_SAMPLES) samples = PA_REF_CAPTURE_RING_SAMPLES;
-
-    portENTER_CRITICAL_ISR(&pa_ref_capture_mux);
-    for (size_t i = 0; i < samples; ++i) {
-        const size_t next = pa_ref_capture_write % PA_REF_CAPTURE_RING_SAMPLES;
-        pa_ref_capture_ring[next] = static_cast<int16_t>(dma[i] >> 16);
-        ++pa_ref_capture_write;
-        if (pa_ref_capture_write - pa_ref_capture_read > PA_REF_CAPTURE_RING_SAMPLES) {
-            pa_ref_capture_read = pa_ref_capture_write - PA_REF_CAPTURE_RING_SAMPLES;
-            ++pa_ref_capture_overruns;
-        }
-    }
-    portEXIT_CRITICAL_ISR(&pa_ref_capture_mux);
+    const uint64_t samples = event->size / sizeof(int32_t);
+    const int64_t now_us = esp_timer_get_time();
+    portENTER_CRITICAL_ISR(&tx_dma_mux);
+    tx_dma_completed_24k += samples;
+    tx_dma_last_sent_us = now_us;
+    ++tx_dma_callbacks;
+    portEXIT_CRITICAL_ISR(&tx_dma_mux);
     return false;
 }
 
-// Drain in task context. Ordering is exactly the order in which TX DMA
-// descriptors completed, so WebSocket chunk arrival timing cannot reorder or
-// compress the AEC reference timeline.
-static void aec_ref_drain_pa_capture(void)
+// Estimate the current playback cursor between DMA completion callbacks.
+// It is bounded by the submitted reference content, so a stopped speaker
+// cannot advance into audio that has not been submitted yet.
+static size_t aec_ref_current_playback_16k(void)
 {
-    static int16_t chunk[240];
-    for (;;) {
-        size_t n = 0;
-        portENTER_CRITICAL(&pa_ref_capture_mux);
-        const size_t available = pa_ref_capture_write - pa_ref_capture_read;
-        if (available > 0) {
-            n = available > sizeof(chunk) / sizeof(chunk[0]) ? sizeof(chunk) / sizeof(chunk[0]) : available;
-            for (size_t i = 0; i < n; ++i) {
-                chunk[i] = pa_ref_capture_ring[(pa_ref_capture_read + i) % PA_REF_CAPTURE_RING_SAMPLES];
-            }
-            pa_ref_capture_read += n;
+    uint64_t completed_24k;
+    int64_t last_sent_us;
+    portENTER_CRITICAL(&tx_dma_mux);
+    completed_24k = tx_dma_completed_24k;
+    last_sent_us = tx_dma_last_sent_us;
+    portEXIT_CRITICAL(&tx_dma_mux);
+
+    uint64_t estimated_24k = completed_24k;
+    if (last_sent_us > 0) {
+        const int64_t elapsed_us = esp_timer_get_time() - last_sent_us;
+        if (elapsed_us > 0 && elapsed_us < 50000) {
+            const uint64_t in_flight = (uint64_t)((elapsed_us * (int64_t)SPK_SAMPLE_RATE) / 1000000LL);
+            const uint64_t max_in_flight = SPK_DMA_SAMPLES_PER_BUFFER;
+            estimated_24k += in_flight > max_in_flight ? max_in_flight : in_flight;
         }
-        portEXIT_CRITICAL(&pa_ref_capture_mux);
-        if (n == 0) break;
-        aec_ref_push_24k(chunk, n);
     }
+
+    size_t submitted_16k;
+    portENTER_CRITICAL(&aec_ref_mux);
+    submitted_16k = aec_ref_write;
+    portEXIT_CRITICAL(&aec_ref_mux);
+
+    const uint64_t estimated_16k = (estimated_24k * MIC_SAMPLE_RATE) / SPK_SAMPLE_RATE;
+    return estimated_16k > submitted_16k ? submitted_16k : (size_t)estimated_16k;
 }
 
 static void aec_ref_pop(int16_t *dest, size_t samples)
@@ -155,16 +155,23 @@ static void aec_ref_pop(int16_t *dest, size_t samples)
 
     portENTER_CRITICAL(&aec_ref_mux);
     const size_t write_pos = aec_ref_write;
+    const size_t playback_pos = aec_ref_current_playback_16k();
     const size_t delay_samples = aec_ref_delay_samples;
-    if (write_pos >= delay_samples + samples) {
-        const size_t target_end = write_pos - delay_samples;
-        if (target_end > aec_ref_last_target_end) {
-            const size_t start = target_end - samples;
-            for (size_t i = 0; i < samples; ++i) {
-                dest[i] = aec_ref_ring[(start + i) % AEC_REF_RING_SAMPLES];
+    const size_t available_end = playback_pos > delay_samples ? playback_pos - delay_samples : 0;
+    if (available_end > aec_ref_last_target_end) {
+        const size_t target_end = available_end;
+        const size_t start = target_end >= samples ? target_end - samples : 0;
+        const size_t oldest = write_pos > AEC_REF_RING_SAMPLES ? write_pos - AEC_REF_RING_SAMPLES : 0;
+        const size_t safe_start = start < oldest ? oldest : start;
+        const size_t available = target_end > safe_start ? target_end - safe_start : 0;
+        const size_t copy_samples = available > samples ? samples : available;
+        if (copy_samples > 0) {
+            const size_t src_start = target_end - copy_samples;
+            for (size_t i = 0; i < copy_samples; ++i) {
+                dest[samples - copy_samples + i] = aec_ref_ring[(src_start + i) % AEC_REF_RING_SAMPLES];
             }
-            aec_ref_last_target_end = target_end;
         }
+        aec_ref_last_target_end = target_end;
     }
     portEXIT_CRITICAL(&aec_ref_mux);
 }
@@ -209,7 +216,7 @@ static void aec_init(void)
     }
 
     aec_ready = true;
-    ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s ref_delay=%ums max=%ums PA_REF=ACTUAL_TX_DMA",
+    ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s ref_delay=%ums max=%ums PA_REF=PCM_SUBMIT+DMA_POSITION",
              aec_get_mode_string(config.mode), frame, config.sample_rate, config.filter_length,
              aec_get_nlp_string(config.nlp_level), (unsigned)AEC_REF_INITIAL_DELAY_MS,
              (unsigned)AEC_REF_MAX_DELAY_MS);
@@ -248,24 +255,29 @@ static void aec_log_frame_levels(const int16_t *mic, const int16_t *ref, const i
         clean_sum += (uint32_t)c;
     }
 
-    size_t ring_count, delay_samples, capture_pending;
-    uint32_t capture_overruns;
+    size_t ring_count, delay_samples;
+    uint64_t dma_completed_24k;
+    int64_t dma_last_sent_us;
+    uint32_t dma_callbacks;
     portENTER_CRITICAL(&aec_ref_mux);
     ring_count = aec_ref_count_locked();
     delay_samples = aec_ref_delay_samples;
     portEXIT_CRITICAL(&aec_ref_mux);
-    portENTER_CRITICAL(&pa_ref_capture_mux);
-    capture_pending = pa_ref_capture_write - pa_ref_capture_read;
-    capture_overruns = pa_ref_capture_overruns;
-    portEXIT_CRITICAL(&pa_ref_capture_mux);
+    portENTER_CRITICAL(&tx_dma_mux);
+    dma_completed_24k = tx_dma_completed_24k;
+    dma_last_sent_us = tx_dma_last_sent_us;
+    dma_callbacks = tx_dma_callbacks;
+    portEXIT_CRITICAL(&tx_dma_mux);
+    const size_t playback_16k = aec_ref_current_playback_16k();
 
-    ESP_LOGI(TAG, "AEC LEVEL: mic_raw(avg=%u max=%u) ref(avg=%u max=%u) clean(avg=%u max=%u) ratio_clean_raw=%u/1000 ref_ring=%u capture_pending=%u overruns=%u ref_delay=%ums",
+    ESP_LOGI(TAG, "AEC LEVEL: mic_raw(avg=%u max=%u) ref(avg=%u max=%u) clean(avg=%u max=%u) ratio_clean_raw=%u/1000 ref_ring=%u playback16=%u dma24=%u callbacks=%u ref_delay=%ums",
              (unsigned)(mic_sum / samples), (unsigned)mic_max,
              (unsigned)(ref_sum / samples), (unsigned)ref_max,
              (unsigned)(clean_sum / samples), (unsigned)clean_max,
              mic_sum ? (unsigned)((clean_sum * 1000ULL) / mic_sum) : 0,
-             (unsigned)ring_count, (unsigned)capture_pending, (unsigned)capture_overruns,
-             (unsigned)((delay_samples * 1000) / MIC_SAMPLE_RATE));
+             (unsigned)ring_count, (unsigned)playback_16k, (unsigned)dma_completed_24k,
+             (unsigned)dma_callbacks, (unsigned)((delay_samples * 1000) / MIC_SAMPLE_RATE));
+    (void)dma_last_sent_us;
 }
 
 static void aec_log_alignment_and_adapt(const int16_t *mic, const int16_t *ref, size_t samples)
@@ -338,12 +350,13 @@ static void aec_log_alignment_and_adapt(const int16_t *mic, const int16_t *ref, 
     portENTER_CRITICAL(&aec_ref_mux);
     applied_delay = aec_ref_delay_samples;
     portEXIT_CRITICAL(&aec_ref_mux);
-    ESP_LOGI(TAG, "AEC ALIGN: best_lag=%ums corr=%u/1000 ref_delay=%ums suggested=%ums applied=%ums",
+    ESP_LOGI(TAG, "AEC ALIGN: best_lag=%ums corr=%u/1000 ref_delay=%ums suggested=%ums applied=%ums playback16=%u",
              (unsigned)(best_lag * 1000 / MIC_SAMPLE_RATE),
              (unsigned)(best_score * 1000.0f),
              (unsigned)(current_delay * 1000 / MIC_SAMPLE_RATE),
              (unsigned)(target * 1000 / MIC_SAMPLE_RATE),
-             (unsigned)(applied_delay * 1000 / MIC_SAMPLE_RATE));
+             (unsigned)(applied_delay * 1000 / MIC_SAMPLE_RATE),
+             (unsigned)aec_ref_current_playback_16k());
 }
 
 void audio_hal_init(void)
@@ -389,7 +402,7 @@ void audio_hal_init(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_cfg));
 
     i2s_event_callbacks_t tx_callbacks = {};
-    tx_callbacks.on_sent = pa_ref_capture_on_sent;
+    tx_callbacks.on_sent = tx_dma_on_sent;
     ESP_ERROR_CHECK(i2s_channel_register_event_callback(tx_handle, &tx_callbacks, nullptr));
 
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
@@ -397,7 +410,7 @@ void audio_hal_init(void)
     log_audio_heap("after_i2s_init");
     aec_init();
     log_audio_heap("after_aec_init");
-    ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT, PA_REF=ACTUAL_TX_DMA",
+    ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT, PA_REF=PCM_SUBMIT+DMA_POSITION",
              MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
 }
 
@@ -459,9 +472,6 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
     for (size_t i = 0; i < samples; ++i) pcm[i] = static_cast<int16_t>(raw[i] >> 16);
 
     if (aec_ready && samples == AEC_FRAME_SAMPLES) {
-        // Pull only what the TX DMA has actually transmitted since the last
-        // mic frame. The WebSocket receive timing is never used here.
-        aec_ref_drain_pa_capture();
         memcpy(mic_frame, pcm, sizeof(mic_frame));
         aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES);
         aec_process(aec_handle, mic_frame, ref_frame, clean_frame);
@@ -509,6 +519,12 @@ void audio_write_speaker(const uint8_t *src, size_t len)
         if (samples_written > n) samples_written = n;
         offset += samples_written;
 
+        // Reference content follows the exact PCM that i2s_channel_write
+        // accepted. DMA timing is tracked independently by tx_dma_on_sent().
+        if (samples_written > 0) {
+            aec_ref_push_24k(pcm + old_offset, samples_written);
+        }
+
         if (err != ESP_OK || samples_written == 0) {
             ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums",
                      esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t)),
@@ -523,7 +539,7 @@ void audio_i2s_test_tone(void)
 {
     static const int16_t sine_table[24] = {
         0, 2071, 4000, 5657, 6928, 7727, 8000, 7727, 6928, 5657, 4000, 2071,
-        0, -2071, -4000, -5657, -6928, -7727, -8000, -6928, -5657, -4000, -2071
+        0, -2071, -4000, -5657, -6928, -7727, -8000, -7727, -6928, -5657, -4000, -2071
     };
     static int16_t tone[2400];
     if (!tx_handle) return;
