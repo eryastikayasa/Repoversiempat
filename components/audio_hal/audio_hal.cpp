@@ -18,12 +18,10 @@ extern "C" {
 static const char *TAG = "AUDIO_HAL";
 static i2s_chan_handle_t rx_handle = NULL;
 static i2s_chan_handle_t tx_handle = NULL;
-
 constexpr size_t AEC_FRAME_SAMPLES = 512;
 constexpr size_t AEC_REF_RING_SAMPLES = 32768;
 constexpr size_t AEC_REF_DELAY_MS = 5;
 constexpr size_t AEC_REF_DELAY_SAMPLES = (MIC_SAMPLE_RATE * AEC_REF_DELAY_MS) / 1000;
-
 static aec_handle_t *aec_handle = NULL;
 static int16_t *aec_ref_ring = nullptr;
 static size_t aec_ref_read = 0;
@@ -31,14 +29,11 @@ static size_t aec_ref_write = 0;
 static size_t aec_ref_last_target_end = 0;
 static portMUX_TYPE aec_ref_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool aec_ready = false;
-
 static srmodel_list_t *ns_models = nullptr;
 static const esp_nsn_iface_t *ns_iface = nullptr;
 static esp_nsn_data_t *ns_data = nullptr;
 static bool ns_ready = false;
-
 static inline size_t aec_ref_count_locked(void) { return aec_ref_write - aec_ref_read; }
-
 static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
 {
     if (!pcm || samples == 0 || !aec_ref_ring) return;
@@ -58,31 +53,23 @@ static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
     }
     portEXIT_CRITICAL(&aec_ref_mux);
 }
-
 static void aec_ref_pop(int16_t *dest, size_t samples)
 {
     if (!dest || samples == 0) return;
     memset(dest, 0, samples * sizeof(int16_t));
     if (!aec_ref_ring) return;
-
     portENTER_CRITICAL(&aec_ref_mux);
     const size_t write_pos = aec_ref_write;
-
-    // Keep the AEC reference at a deterministic acoustic-history position.
-    // ESP-ADF documents a 0-10 ms recording/reference alignment window.
     if (write_pos >= AEC_REF_DELAY_SAMPLES + samples) {
         const size_t target_end = write_pos - AEC_REF_DELAY_SAMPLES;
         if (target_end > aec_ref_last_target_end) {
             const size_t start = target_end - samples;
-            for (size_t i = 0; i < samples; ++i) {
-                dest[i] = aec_ref_ring[(start + i) % AEC_REF_RING_SAMPLES];
-            }
+            for (size_t i = 0; i < samples; ++i) dest[i] = aec_ref_ring[(start + i) % AEC_REF_RING_SAMPLES];
             aec_ref_last_target_end = target_end;
         }
     }
     portEXIT_CRITICAL(&aec_ref_mux);
 }
-
 static void aec_init(void)
 {
     aec_ref_ring = static_cast<int16_t *>(heap_caps_calloc(AEC_REF_RING_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -102,7 +89,6 @@ static void aec_init(void)
     aec_ready = true;
     ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s ref_delay=%ums", aec_get_mode_string(config.mode), frame, config.sample_rate, config.filter_length, aec_get_nlp_string(config.nlp_level), (unsigned)AEC_REF_DELAY_MS);
 }
-
 static void log_audio_heap(const char *stage)
 {
     size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -111,7 +97,6 @@ static void log_audio_heap(const char *stage)
     size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_LOGI(TAG, "HEAP[%s]: internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u", stage, (unsigned)internal_free, (unsigned)internal_largest, (unsigned)psram_free, (unsigned)psram_largest);
 }
-
 void audio_hal_init(void)
 {
     ESP_LOGI(TAG, "Menginisialisasi Audio I2S - proven v6.1.5 / Xiaozhi-compatible...");
@@ -138,7 +123,6 @@ void audio_hal_init(void)
     log_audio_heap("after_i2s_init"); aec_init(); log_audio_heap("after_aec_init");
     ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT", MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
 }
-
 void audio_hal_ns_init(void)
 {
     if (ns_ready) return;
@@ -156,7 +140,6 @@ void audio_hal_ns_init(void)
     log_audio_heap("after_nsnet2_init");
     ESP_LOGI(TAG, "ESP-SR NSNet2 READY: model=%s frame=%d rate=%dHz", model_name, chunk, MIC_SAMPLE_RATE);
 }
-
 size_t audio_read_mic(uint8_t *dest, size_t max_len)
 {
     if (!rx_handle || !dest || max_len < sizeof(int16_t)) return 0;
@@ -190,7 +173,6 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
     }
     return samples * sizeof(int16_t);
 }
-
 void audio_write_speaker(const uint8_t *src, size_t len)
 {
     if (!tx_handle || !src || len < 2) return;
@@ -207,7 +189,6 @@ void audio_write_speaker(const uint8_t *src, size_t len)
         if (err != ESP_OK || samples_written == 0) { ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums", esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t)), (unsigned)I2S_WRITE_TIMEOUT_MS); vTaskDelay(1); return; }
     }
 }
-
 void audio_i2s_test_tone(void)
 {
     static const int16_t sine_table[24] = {0, 2071, 4000, 5657, 6928, 7727, 8000, 7727, 6928, 5657, 4000, 2071, 0, -2071, -4000, -5657, -6928, -7727, -8000, -6928, -5657, -4000, -2071};
