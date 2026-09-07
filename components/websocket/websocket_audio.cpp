@@ -159,3 +159,96 @@ bool start_audio_playback(void)
     ESP_LOGI(TAG, "Audio ring buffer siap: %u byte, prebuffer=%u, target=%u B/s, playback core=1 priority=3", (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE, (unsigned)AUDIO_OUTPUT_BYTES_PER_SEC);
     return true;
 }
+
+void request_audio_buffer_clear(void) { audio_clear_pending = true; }
+
+void clear_audio_buffer(void)
+{
+    audio_clear_pending = false;
+    if (audio_send_mutex != NULL) {
+        xSemaphoreTake(audio_send_mutex, portMAX_DELAY);
+        if (audio_stream != NULL) xStreamBufferReset(audio_stream);
+        xSemaphoreGive(audio_send_mutex);
+    } else if (audio_stream != NULL) {
+        xStreamBufferReset(audio_stream);
+    }
+    audio_turn_complete_pending = false;
+    audio_turn_active = false;
+}
+
+void reset_audio_turn_stats(void)
+{
+    audio_chunks_received = 0;
+    audio_bytes_received = 0;
+    audio_bytes_queued = 0;
+    audio_write_calls = 0;
+    audio_bytes_played = 0;
+    audio_bytes_dropped = 0;
+    audio_turn_active = false;
+    audio_turn_complete_pending = false;
+}
+
+void begin_audio_turn(void)
+{
+    if (audio_turn_active) return;
+    audio_chunks_received = 0;
+    audio_bytes_received = 0;
+    audio_bytes_queued = 0;
+    audio_write_calls = 0;
+    audio_bytes_played = 0;
+    audio_bytes_dropped = 0;
+
+    if (audio_stream != NULL) {
+        size_t stale = xStreamBufferBytesAvailable(audio_stream);
+        if (stale > 0) {
+            xStreamBufferReset(audio_stream);
+            audio_bytes_dropped = stale;
+            ESP_LOGW(TAG, "Audio stale PCM dibuang saat turn baru: %u byte", (unsigned)stale);
+        }
+    }
+
+    uint32_t next_generation = audio_turn_generation + 1U;
+    if (next_generation == 0U) next_generation = 1U;
+    audio_turn_generation = next_generation;
+    audio_turn_active = true;
+    audio_turn_complete_pending = false;
+}
+
+bool queue_audio_pcm(const uint8_t *pcm, size_t len)
+{
+    if (pcm == NULL || len == 0) return false;
+    len &= ~((size_t)1);
+    if (len == 0) return false;
+    if (audio_stream == NULL && !start_audio_playback()) return false;
+    if (audio_stream == NULL) return false;
+    if (audio_send_mutex == NULL) {
+        ESP_LOGE(TAG, "Audio send mutex belum siap");
+        return false;
+    }
+    if (xSemaphoreTake(audio_send_mutex, portMAX_DELAY) != pdTRUE) {
+        ESP_LOGE(TAG, "Gagal mengambil audio send mutex");
+        return false;
+    }
+
+    begin_audio_turn();
+
+    uint64_t queued_before = audio_bytes_queued;
+    uint64_t dropped_before = audio_bytes_dropped;
+
+    // Volume feature removed: Gemini PCM masuk ke playback tanpa modifikasi.
+    (void)send_realtime_pcm(pcm, len);
+
+    const uint64_t queued_delta = audio_bytes_queued - queued_before;
+    const uint64_t dropped_delta = audio_bytes_dropped - dropped_before;
+    const uint64_t accounted_delta = queued_delta + dropped_delta;
+    if (accounted_delta < (uint64_t)len) {
+        const uint64_t missing = (uint64_t)len - accounted_delta;
+        audio_bytes_dropped += missing;
+        ESP_LOGW(TAG, "Audio accounting guard: %llu byte -> dropped", (unsigned long long)missing);
+    } else if (accounted_delta > (uint64_t)len) {
+        ESP_LOGW(TAG, "Audio accounting anomaly: accounted_delta=%llu len=%u", (unsigned long long)accounted_delta, (unsigned)len);
+    }
+
+    xSemaphoreGive(audio_send_mutex);
+    return queued_delta == (uint64_t)len;
+}
