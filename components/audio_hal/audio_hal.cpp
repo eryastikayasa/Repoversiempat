@@ -415,7 +415,7 @@ void audio_write_speaker(const uint8_t *src, size_t len)
     const int16_t *pcm = reinterpret_cast<const int16_t *>(src);
     size_t total = len / sizeof(int16_t), offset = 0;
     constexpr size_t I2S_WRITE_SAMPLES = 240;
-    constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
+    constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 100;  // Increased from 50ms
 
     while (offset < total) {
         const size_t old_offset = offset;
