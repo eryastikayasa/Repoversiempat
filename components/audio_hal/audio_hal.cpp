@@ -68,15 +68,10 @@ static void aec_ref_pop(int16_t *dest, size_t samples)
     portENTER_CRITICAL(&aec_ref_mux);
     const size_t write_pos = aec_ref_write;
 
-    // ESP-ADF documents that the AEC recording signal should be delayed
-    // roughly 0-10 ms relative to its playback reference. Keep a fixed,
-    // deterministic reference history instead of consuming the ring at an
-    // emergent task-scheduling-dependent position.
+    // Keep the AEC reference at a deterministic acoustic-history position.
+    // ESP-ADF documents a 0-10 ms recording/reference alignment window.
     if (write_pos >= AEC_REF_DELAY_SAMPLES + samples) {
         const size_t target_end = write_pos - AEC_REF_DELAY_SAMPLES;
-
-        // If playback has not advanced since the previous frame, do not feed
-        // the AEC the same reference repeatedly. Leave this frame as zeros.
         if (target_end > aec_ref_last_target_end) {
             const size_t start = target_end - samples;
             for (size_t i = 0; i < samples; ++i) {
@@ -96,7 +91,7 @@ static void aec_init(void)
     config.mic_num = 1; config.ref_num = 1; config.out_num = 1;
     config.filter_length = 4; config.sample_rate = MIC_SAMPLE_RATE;
     config.caps = MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT;
-    config.mode = AEC_MODE_FD_LOW_COST; config.nlp_level = AEC_NLP_LEVEL_NORMAL;
+    config.mode = AEC_MODE_FD_LOW_COST; config.nlp_level = AEC_NLP_LEVEL_AGGR;
     aec_handle = aec_create_from_config(&config);
     if (!aec_handle) { ESP_LOGE(TAG, "ESP-SR AEC init gagal - MIC akan tetap berjalan tanpa AEC"); heap_caps_free(aec_ref_ring); aec_ref_ring = nullptr; aec_ready = false; return; }
     int frame = aec_get_chunksize(aec_handle);
@@ -147,41 +142,16 @@ void audio_hal_init(void)
 void audio_hal_ns_init(void)
 {
     if (ns_ready) return;
-
     ns_models = esp_srmodel_init("model");
-    if (!ns_models) {
-        ESP_LOGE(TAG, "ESP-SR NSNet2 init gagal: model partition tidak tersedia");
-        return;
-    }
-
+    if (!ns_models) { ESP_LOGE(TAG, "ESP-SR NSNet2 init gagal: model partition tidak tersedia"); return; }
     char *model_name = esp_srmodel_filter(ns_models, ESP_NSNET_PREFIX, NULL);
-    if (!model_name) {
-        ESP_LOGE(TAG, "ESP-SR NSNet model tidak ditemukan di srmodels.bin");
-        return;
-    }
-
+    if (!model_name) { ESP_LOGE(TAG, "ESP-SR NSNet model tidak ditemukan di srmodels.bin"); return; }
     ns_iface = esp_nsnet_handle_from_name(model_name);
-    if (!ns_iface) {
-        ESP_LOGE(TAG, "ESP-SR NSNet handle tidak ditemukan: %s", model_name);
-        return;
-    }
-
+    if (!ns_iface) { ESP_LOGE(TAG, "ESP-SR NSNet handle tidak ditemukan: %s", model_name); return; }
     ns_data = ns_iface->create(model_name);
-    if (!ns_data) {
-        ESP_LOGE(TAG, "ESP-SR NSNet create gagal: %s", model_name);
-        ns_iface = nullptr;
-        return;
-    }
-
+    if (!ns_data) { ESP_LOGE(TAG, "ESP-SR NSNet create gagal: %s", model_name); ns_iface = nullptr; return; }
     int chunk = ns_iface->get_samp_chunksize(ns_data);
-    if (chunk != (int)AEC_FRAME_SAMPLES) {
-        ESP_LOGE(TAG, "ESP-SR NSNet frame tidak cocok: chunk=%d expected=%u", chunk, (unsigned)AEC_FRAME_SAMPLES);
-        ns_iface->destroy(ns_data);
-        ns_data = nullptr;
-        ns_iface = nullptr;
-        return;
-    }
-
+    if (chunk != (int)AEC_FRAME_SAMPLES) { ESP_LOGE(TAG, "ESP-SR NSNet frame tidak cocok: chunk=%d expected=%u", chunk, (unsigned)AEC_FRAME_SAMPLES); ns_iface->destroy(ns_data); ns_data = nullptr; ns_iface = nullptr; return; }
     ns_ready = true;
     log_audio_heap("after_nsnet2_init");
     ESP_LOGI(TAG, "ESP-SR NSNet2 READY: model=%s frame=%d rate=%dHz", model_name, chunk, MIC_SAMPLE_RATE);
@@ -191,7 +161,6 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
 {
     if (!rx_handle || !dest || max_len < sizeof(int16_t)) return 0;
     if (!ns_ready) audio_hal_ns_init();
-
     static int32_t raw[512];
     static int16_t mic_frame[AEC_FRAME_SAMPLES];
     static int16_t ref_frame[AEC_FRAME_SAMPLES];
@@ -202,25 +171,17 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
     if (i2s_channel_read(rx_handle, raw, max_samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) return 0;
     size_t samples = bytes_read / sizeof(int32_t); int16_t *pcm = reinterpret_cast<int16_t *>(dest);
     for (size_t i = 0; i < samples; ++i) pcm[i] = static_cast<int16_t>(raw[i] >> 16);
-
     if (aec_ready && samples == AEC_FRAME_SAMPLES) {
         memcpy(mic_frame, pcm, sizeof(mic_frame));
         aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES);
         aec_process(aec_handle, mic_frame, ref_frame, clean_frame);
         memcpy(pcm, clean_frame, sizeof(clean_frame));
     }
-
-    // ESP-SR NSNet2 runs after AEC so speaker reference handling is unchanged.
-    // It processes the same 512-sample / 32 ms frame used by the AEC path.
     if (ns_ready && samples == AEC_FRAME_SAMPLES) {
         ns_iface->process(ns_data, pcm, ns_frame);
         memcpy(pcm, ns_frame, sizeof(ns_frame));
     }
-
-    // Preserve the original mic/reference scale for AEC, then boost only the
-    // processed signal sent to Gemini. This raises far-field speech without
-    // changing echo-cancellation reference behavior.
-    constexpr int MIC_OUTPUT_GAIN = 4; // +12 dB
+    constexpr int MIC_OUTPUT_GAIN = 4;
     for (size_t i = 0; i < samples; ++i) {
         int32_t value = (int32_t)pcm[i] * MIC_OUTPUT_GAIN;
         if (value > INT16_MAX) value = INT16_MAX;
@@ -249,20 +210,10 @@ void audio_write_speaker(const uint8_t *src, size_t len)
 
 void audio_i2s_test_tone(void)
 {
-    static const int16_t sine_table[24] = {
-        0, 2071, 4000, 5657, 6928, 7727, 8000, 7727, 6928, 5657, 4000, 2071,
-        0, -2071, -4000, -5657, -6928, -7727, -8000, -6928, -5657, -4000, -2071
-    };
+    static const int16_t sine_table[24] = {0, 2071, 4000, 5657, 6928, 7727, 8000, 7727, 6928, 5657, 4000, 2071, 0, -2071, -4000, -5657, -6928, -7727, -8000, -6928, -5657, -4000, -2071};
     static int16_t tone[2400];
-
-    if (!tx_handle) {
-        return;
-    }
-
-    for (size_t i = 0; i < 2400; ++i) {
-        tone[i] = sine_table[i % 24];
-    }
-
+    if (!tx_handle) return;
+    for (size_t i = 0; i < 2400; ++i) tone[i] = sine_table[i % 24];
     ESP_LOGI(TAG, "I2S TEST TONE: 1kHz PCM16 -> PCM32 I2S, 24kHz, 100ms");
     audio_write_speaker(reinterpret_cast<const uint8_t *>(tone), sizeof(tone));
 }
