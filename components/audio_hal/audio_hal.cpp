@@ -22,39 +22,108 @@ static i2s_chan_handle_t rx_handle = NULL;
 static i2s_chan_handle_t tx_handle = NULL;
 constexpr size_t AEC_FRAME_SAMPLES = 512;
 constexpr size_t AEC_REF_RING_SAMPLES = 32768;
-constexpr size_t AEC_REF_DELAY_MS = 5;
-constexpr size_t AEC_REF_DELAY_SAMPLES = (MIC_SAMPLE_RATE * AEC_REF_DELAY_MS) / 1000;
+constexpr size_t AEC_REF_INITIAL_DELAY_MS = 5;
+constexpr size_t AEC_REF_MAX_DELAY_MS = 20;
+constexpr size_t AEC_REF_INITIAL_DELAY_SAMPLES = (MIC_SAMPLE_RATE * AEC_REF_INITIAL_DELAY_MS) / 1000;
+constexpr size_t AEC_REF_MAX_DELAY_SAMPLES = (MIC_SAMPLE_RATE * AEC_REF_MAX_DELAY_MS) / 1000;
 static aec_handle_t *aec_handle = NULL;
 static int16_t *aec_ref_ring = nullptr;
 static size_t aec_ref_read = 0;
 static size_t aec_ref_write = 0;
 static size_t aec_ref_last_target_end = 0;
+static size_t aec_ref_delay_samples = AEC_REF_INITIAL_DELAY_SAMPLES;
 static portMUX_TYPE aec_ref_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool aec_ready = false;
 static srmodel_list_t *ns_models = nullptr;
 static const esp_nsn_iface_t *ns_iface = nullptr;
 static esp_nsn_data_t *ns_data = nullptr;
 static bool ns_ready = false;
+
 static inline size_t aec_ref_count_locked(void) { return aec_ref_write - aec_ref_read; }
+
+static void aec_ref_push_16k_sample(int16_t sample)
+{
+    const size_t next = aec_ref_write % AEC_REF_RING_SAMPLES;
+    aec_ref_ring[next] = sample;
+    ++aec_ref_write;
+    if (aec_ref_count_locked() > AEC_REF_RING_SAMPLES) aec_ref_read = aec_ref_write - AEC_REF_RING_SAMPLES;
+}
+
+// The speaker path is 24 kHz while ESP-SR AEC is 16 kHz. Use stateful
+// linear interpolation instead of selecting 2 samples out of every 3.
 static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
 {
     if (!pcm || samples == 0 || !aec_ref_ring) return;
-    static uint32_t phase = 0;
-    constexpr uint32_t STEP = 2;
-    constexpr uint32_t DEN = 3;
+    static bool have_prev = false;
+    static int16_t prev = 0;
+    static uint64_t input_index = 0;
+    static uint64_t next_output_half = 0;
+
     portENTER_CRITICAL(&aec_ref_mux);
     for (size_t i = 0; i < samples; ++i) {
-        phase += STEP;
-        if (phase >= DEN) {
-            phase -= DEN;
-            size_t next = aec_ref_write % AEC_REF_RING_SAMPLES;
-            aec_ref_ring[next] = pcm[i];
-            ++aec_ref_write;
-            if (aec_ref_count_locked() > AEC_REF_RING_SAMPLES) aec_ref_read = aec_ref_write - AEC_REF_RING_SAMPLES;
+        const int16_t cur = pcm[i];
+        const uint64_t idx = input_index++;
+        if (!have_prev) {
+            prev = cur;
+            have_prev = true;
+            next_output_half = 3; // first new output at 1.5 input samples
+            continue;
         }
+
+        // Output positions are 1.5 input samples apart: 1.5, 3.0, 4.5 ...
+        const uint64_t cur_half = idx * 2;
+        if (cur_half >= next_output_half) {
+            const uint64_t prev_half = (idx - 1) * 2;
+            const uint64_t frac_half = next_output_half - prev_half;
+            int32_t out = (int32_t)prev + (((int32_t)cur - (int32_t)prev) * (int32_t)frac_half) / 2;
+            if (out > INT16_MAX) out = INT16_MAX;
+            if (out < INT16_MIN) out = INT16_MIN;
+            aec_ref_push_16k_sample((int16_t)out);
+            next_output_half += 3;
+        }
+        prev = cur;
     }
     portEXIT_CRITICAL(&aec_ref_mux);
 }
+
+static void aec_ref_push_silence_samples(size_t samples)
+{
+    if (!aec_ref_ring || samples == 0) return;
+    portENTER_CRITICAL(&aec_ref_mux);
+    while (samples--) aec_ref_push_16k_sample(0);
+    portEXIT_CRITICAL(&aec_ref_mux);
+}
+
+// Keep the reference timeline tied to wall-clock playback. If Gemini pauses
+// between PCM packets, those missing playback samples must appear as zeros in
+// the AEC reference instead of collapsing the timeline.
+static void aec_ref_sync_playback_gap(void)
+{
+    static int64_t last_write_us = 0;
+    const int64_t now_us = esp_timer_get_time();
+    if (last_write_us == 0) {
+        last_write_us = now_us;
+        return;
+    }
+
+    const int64_t elapsed_us = now_us - last_write_us;
+    if (elapsed_us <= 12000) return;
+
+    const int64_t gap_us = elapsed_us - 10000;
+    size_t gap_samples = (size_t)((gap_us * MIC_SAMPLE_RATE) / 1000000LL);
+    if (gap_samples > AEC_REF_RING_SAMPLES / 2) gap_samples = AEC_REF_RING_SAMPLES / 2;
+    if (gap_samples > 0) aec_ref_push_silence_samples(gap_samples);
+    last_write_us = now_us;
+}
+
+static void aec_ref_mark_playback_write_complete(void)
+{
+    static int64_t *last_write_us_ptr = nullptr;
+    (void)last_write_us_ptr;
+    // The gap synchronizer owns its timestamp; this function intentionally
+    // remains empty so reference samples are timestamped at write boundaries.
+}
+
 static void aec_ref_pop(int16_t *dest, size_t samples)
 {
     if (!dest || samples == 0) return;
@@ -62,8 +131,9 @@ static void aec_ref_pop(int16_t *dest, size_t samples)
     if (!aec_ref_ring) return;
     portENTER_CRITICAL(&aec_ref_mux);
     const size_t write_pos = aec_ref_write;
-    if (write_pos >= AEC_REF_DELAY_SAMPLES + samples) {
-        const size_t target_end = write_pos - AEC_REF_DELAY_SAMPLES;
+    const size_t delay_samples = aec_ref_delay_samples;
+    if (write_pos >= delay_samples + samples) {
+        const size_t target_end = write_pos - delay_samples;
         if (target_end > aec_ref_last_target_end) {
             const size_t start = target_end - samples;
             for (size_t i = 0; i < samples; ++i) dest[i] = aec_ref_ring[(start + i) % AEC_REF_RING_SAMPLES];
@@ -72,6 +142,7 @@ static void aec_ref_pop(int16_t *dest, size_t samples)
     }
     portEXIT_CRITICAL(&aec_ref_mux);
 }
+
 static void aec_init(void)
 {
     aec_ref_ring = static_cast<int16_t *>(heap_caps_calloc(AEC_REF_RING_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
@@ -86,8 +157,9 @@ static void aec_init(void)
     int frame = aec_get_chunksize(aec_handle);
     if (frame != (int)AEC_FRAME_SAMPLES) { ESP_LOGE(TAG, "ESP-SR AEC frame tidak cocok: %d, expected=%u", frame, (unsigned)AEC_FRAME_SAMPLES); aec_destroy(aec_handle); aec_handle = NULL; heap_caps_free(aec_ref_ring); aec_ref_ring = nullptr; aec_ready = false; return; }
     aec_ready = true;
-    ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s ref_delay=%ums", aec_get_mode_string(config.mode), frame, config.sample_rate, config.filter_length, aec_get_nlp_string(config.nlp_level), (unsigned)AEC_REF_DELAY_MS);
+    ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s ref_delay=%ums max=%ums", aec_get_mode_string(config.mode), frame, config.sample_rate, config.filter_length, aec_get_nlp_string(config.nlp_level), (unsigned)AEC_REF_INITIAL_DELAY_MS, (unsigned)AEC_REF_MAX_DELAY_MS);
 }
+
 static void log_audio_heap(const char *stage)
 {
     size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
@@ -96,6 +168,7 @@ static void log_audio_heap(const char *stage)
     size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_LOGI(TAG, "HEAP[%s]: internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u", stage, (unsigned)internal_free, (unsigned)internal_largest, (unsigned)psram_free, (unsigned)psram_largest);
 }
+
 static void aec_log_frame_levels(const int16_t *mic, const int16_t *ref, const int16_t *clean, size_t samples)
 {
     if (!mic || !ref || !clean || samples == 0) return;
@@ -112,31 +185,29 @@ static void aec_log_frame_levels(const int16_t *mic, const int16_t *ref, const i
         if (m > mic_max) mic_max = m;
         if (r > ref_max) ref_max = r;
         if (c > clean_max) clean_max = c;
-        mic_sum += (uint32_t)m;
-        ref_sum += (uint32_t)r;
-        clean_sum += (uint32_t)c;
+        mic_sum += (uint32_t)m; ref_sum += (uint32_t)r; clean_sum += (uint32_t)c;
     }
-    ESP_LOGI(TAG, "AEC LEVEL: mic_raw(avg=%u max=%u) ref(avg=%u max=%u) clean(avg=%u max=%u) ratio_clean_raw=%u/1000 ref_ring=%u samples",
-             (unsigned)(mic_sum / samples), (unsigned)mic_max,
-             (unsigned)(ref_sum / samples), (unsigned)ref_max,
-             (unsigned)(clean_sum / samples), (unsigned)clean_max,
-             mic_sum ? (unsigned)((clean_sum * 1000ULL) / mic_sum) : 0,
-             (unsigned)aec_ref_count_locked());
+    size_t ring_count;
+    portENTER_CRITICAL(&aec_ref_mux); ring_count = aec_ref_count_locked(); portEXIT_CRITICAL(&aec_ref_mux);
+    ESP_LOGI(TAG, "AEC LEVEL: mic_raw(avg=%u max=%u) ref(avg=%u max=%u) clean(avg=%u max=%u) ratio_clean_raw=%u/1000 ref_ring=%u samples ref_delay=%ums",
+             (unsigned)(mic_sum / samples), (unsigned)mic_max, (unsigned)(ref_sum / samples), (unsigned)ref_max,
+             (unsigned)(clean_sum / samples), (unsigned)clean_max, mic_sum ? (unsigned)((clean_sum * 1000ULL) / mic_sum) : 0,
+             (unsigned)ring_count, (unsigned)((aec_ref_delay_samples * 1000) / MIC_SAMPLE_RATE));
 }
-static void aec_log_alignment(const int16_t *mic, const int16_t *ref, size_t samples)
+
+static void aec_log_alignment_and_adapt(const int16_t *mic, const int16_t *ref, size_t samples)
 {
     if (!mic || !ref || samples < 64) return;
     static int64_t last_log_us = 0;
+    static size_t stable_delay = AEC_REF_INITIAL_DELAY_SAMPLES;
+    static unsigned stable_hits = 0;
     const int64_t now_us = esp_timer_get_time();
     if (last_log_us != 0 && now_us - last_log_us < 1000000) return;
     last_log_us = now_us;
 
     uint64_t ref_sum = 0;
-    for (size_t i = 0; i < samples; ++i) {
-        int32_t v = ref[i]; if (v < 0) v = -v;
-        ref_sum += (uint32_t)v;
-    }
-    if ((ref_sum / samples) < 300) return;
+    for (size_t i = 0; i < samples; ++i) { int32_t v = ref[i]; if (v < 0) v = -v; ref_sum += (uint32_t)v; }
+    if ((ref_sum / samples) < 500) return;
 
     float best_score = 0.0f;
     size_t best_lag = 0;
@@ -144,29 +215,44 @@ static void aec_log_alignment(const int16_t *mic, const int16_t *ref, size_t sam
     constexpr size_t LAG_STEP_SAMPLES = 16;
     for (size_t lag = 0; lag <= MAX_LAG_SAMPLES; lag += LAG_STEP_SAMPLES) {
         const size_t n = samples - lag;
-        double dot = 0.0;
-        double mic_energy = 0.0;
-        double ref_energy = 0.0;
+        double dot = 0.0, mic_energy = 0.0, ref_energy = 0.0;
         for (size_t i = 0; i < n; ++i) {
             const double m = (double)mic[i + lag];
             const double r = (double)ref[i];
-            dot += m * r;
-            mic_energy += m * m;
-            ref_energy += r * r;
+            dot += m * r; mic_energy += m * m; ref_energy += r * r;
         }
         if (mic_energy <= 0.0 || ref_energy <= 0.0) continue;
         const float score = (float)(fabs(dot) / sqrt(mic_energy * ref_energy));
-        if (score > best_score) {
-            best_score = score;
-            best_lag = lag;
-        }
+        if (score > best_score) { best_score = score; best_lag = lag; }
     }
-    ESP_LOGI(TAG, "AEC ALIGN: best_lag=%ums corr=%u/1000 current_ref_delay=%ums ref_avg=%u",
-             (unsigned)(best_lag * 1000 / MIC_SAMPLE_RATE),
-             (unsigned)(best_score * 1000.0f),
-             (unsigned)AEC_REF_DELAY_MS,
-             (unsigned)(ref_sum / samples));
+
+    size_t current_delay;
+    portENTER_CRITICAL(&aec_ref_mux); current_delay = aec_ref_delay_samples; portEXIT_CRITICAL(&aec_ref_mux);
+    const size_t suggested = current_delay + best_lag;
+    size_t target = suggested > AEC_REF_MAX_DELAY_SAMPLES ? AEC_REF_MAX_DELAY_SAMPLES : suggested;
+    const bool reliable = best_score >= 0.55f && best_lag <= (AEC_REF_MAX_DELAY_SAMPLES / 2);
+    if (reliable && target != current_delay) {
+        if (target > stable_delay + 16 || target + 16 < stable_delay) { stable_delay = target; stable_hits = 1; }
+        else { stable_hits++; }
+        if (stable_hits >= 3) {
+            portENTER_CRITICAL(&aec_ref_mux);
+            aec_ref_delay_samples = stable_delay;
+            aec_ref_last_target_end = 0;
+            portEXIT_CRITICAL(&aec_ref_mux);
+            stable_hits = 0;
+        }
+    } else {
+        stable_hits = 0;
+    }
+
+    size_t applied_delay;
+    portENTER_CRITICAL(&aec_ref_mux); applied_delay = aec_ref_delay_samples; portEXIT_CRITICAL(&aec_ref_mux);
+    ESP_LOGI(TAG, "AEC ALIGN: best_lag=%ums corr=%u/1000 ref_delay=%ums suggested=%ums applied=%ums",
+             (unsigned)(best_lag * 1000 / MIC_SAMPLE_RATE), (unsigned)(best_score * 1000.0f),
+             (unsigned)(current_delay * 1000 / MIC_SAMPLE_RATE), (unsigned)(target * 1000 / MIC_SAMPLE_RATE),
+             (unsigned)(applied_delay * 1000 / MIC_SAMPLE_RATE));
 }
+
 void audio_hal_init(void)
 {
     ESP_LOGI(TAG, "Menginisialisasi Audio I2S - proven v6.1.5 / Xiaozhi-compatible...");
@@ -192,6 +278,7 @@ void audio_hal_init(void)
     log_audio_heap("after_i2s_init"); aec_init(); log_audio_heap("after_aec_init");
     ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT", MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
 }
+
 void audio_hal_ns_init(void)
 {
     if (ns_ready) return;
@@ -209,6 +296,7 @@ void audio_hal_ns_init(void)
     log_audio_heap("after_nsnet2_init");
     ESP_LOGI(TAG, "ESP-SR NSNet2 READY: model=%s frame=%d rate=%dHz", model_name, chunk, MIC_SAMPLE_RATE);
 }
+
 size_t audio_read_mic(uint8_t *dest, size_t max_len)
 {
     if (!rx_handle || !dest || max_len < sizeof(int16_t)) return 0;
@@ -228,14 +316,14 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
         aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES);
         aec_process(aec_handle, mic_frame, ref_frame, clean_frame);
         aec_log_frame_levels(mic_frame, ref_frame, clean_frame, AEC_FRAME_SAMPLES);
-        aec_log_alignment(mic_frame, ref_frame, AEC_FRAME_SAMPLES);
+        aec_log_alignment_and_adapt(mic_frame, ref_frame, AEC_FRAME_SAMPLES);
         memcpy(pcm, clean_frame, sizeof(clean_frame));
     }
     if (ns_ready && samples == AEC_FRAME_SAMPLES) {
         ns_iface->process(ns_data, pcm, ns_frame);
         memcpy(pcm, ns_frame, sizeof(ns_frame));
     }
-    constexpr int MIC_OUTPUT_GAIN = 4;
+    constexpr int MIC_OUTPUT_GAIN = 2;
     for (size_t i = 0; i < samples; ++i) {
         int32_t value = (int32_t)pcm[i] * MIC_OUTPUT_GAIN;
         if (value > INT16_MAX) value = INT16_MAX;
@@ -244,22 +332,37 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
     }
     return samples * sizeof(int16_t);
 }
+
 void audio_write_speaker(const uint8_t *src, size_t len)
 {
     if (!tx_handle || !src || len < 2) return;
-    len &= ~((size_t)1); static int32_t tx_buffer[1024]; static int16_t ref_pcm[512];
-    const int16_t *pcm = reinterpret_cast<const int16_t *>(src); size_t total = len / sizeof(int16_t), offset = 0;
-    constexpr size_t I2S_WRITE_SAMPLES = 240; constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
+    len &= ~((size_t)1);
+    static int32_t tx_buffer[1024];
+    static int16_t ref_pcm[512];
+    aec_ref_sync_playback_gap();
+    const int16_t *pcm = reinterpret_cast<const int16_t *>(src);
+    size_t total = len / sizeof(int16_t), offset = 0;
+    constexpr size_t I2S_WRITE_SAMPLES = 240;
+    constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
     while (offset < total) {
-        const size_t old_offset = offset; size_t n = total - offset; if (n > I2S_WRITE_SAMPLES) n = I2S_WRITE_SAMPLES;
+        const size_t old_offset = offset;
+        size_t n = total - offset; if (n > I2S_WRITE_SAMPLES) n = I2S_WRITE_SAMPLES;
         for (size_t i = 0; i < n; ++i) tx_buffer[i] = static_cast<int32_t>(pcm[old_offset + i]) << 16;
-        size_t written = 0; esp_err_t err = i2s_channel_write(tx_handle, tx_buffer, n * sizeof(int32_t), &written, I2S_WRITE_TIMEOUT_MS);
+        size_t written = 0;
+        esp_err_t err = i2s_channel_write(tx_handle, tx_buffer, n * sizeof(int32_t), &written, I2S_WRITE_TIMEOUT_MS);
         size_t samples_written = written / sizeof(int32_t); if (samples_written > n) samples_written = n;
-        if (aec_ready && samples_written > 0) { for (size_t i = 0; i < samples_written; ++i) ref_pcm[i] = pcm[old_offset + i]; aec_ref_push_24k(ref_pcm, samples_written); }
+        if (aec_ready && samples_written > 0) {
+            for (size_t i = 0; i < samples_written; ++i) ref_pcm[i] = pcm[old_offset + i];
+            aec_ref_push_24k(ref_pcm, samples_written);
+        }
         offset += samples_written;
-        if (err != ESP_OK || samples_written == 0) { ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums", esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t)), (unsigned)I2S_WRITE_TIMEOUT_MS); vTaskDelay(1); return; }
+        if (err != ESP_OK || samples_written == 0) {
+            ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums", esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t)), (unsigned)I2S_WRITE_TIMEOUT_MS);
+            vTaskDelay(1); return;
+        }
     }
 }
+
 void audio_i2s_test_tone(void)
 {
     static const int16_t sine_table[24] = {0, 2071, 4000, 5657, 6928, 7727, 8000, 7727, 6928, 5657, 4000, 2071, 0, -2071, -4000, -5657, -6928, -7727, -8000, -6928, -5657, -4000, -2071};
