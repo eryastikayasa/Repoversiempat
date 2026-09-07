@@ -72,7 +72,7 @@ static void aec_ref_pop(int16_t *dest, size_t samples)
 }
 static void aec_init(void)
 {
-    aec_ref_ring = static_cast<int16_t *>(heap_caps_calloc(AEC_REF_RING_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
+    aec_ref_ring = static_cast<int16_t *>(heap_caps_calloc(AEC_REF_RING_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!aec_ref_ring) { ESP_LOGE(TAG, "AEC reference ring PSRAM allocation gagal - MIC akan tetap berjalan tanpa AEC"); aec_ready = false; return; }
     aec_config_t config = {};
     config.mic_num = 1; config.ref_num = 1; config.out_num = 1;
@@ -82,10 +82,7 @@ static void aec_init(void)
     aec_handle = aec_create_from_config(&config);
     if (!aec_handle) { ESP_LOGE(TAG, "ESP-SR AEC init gagal - MIC akan tetap berjalan tanpa AEC"); heap_caps_free(aec_ref_ring); aec_ref_ring = nullptr; aec_ready = false; return; }
     int frame = aec_get_chunksize(aec_handle);
-    if (frame != (int)AEC_FRAME_SAMPLES) {
-        ESP_LOGE(TAG, "ESP-SR AEC frame tidak cocok: %d, expected=%u", frame, (unsigned)AEC_FRAME_SAMPLES);
-        aec_destroy(aec_handle); aec_handle = NULL; heap_caps_free(aec_ref_ring); aec_ref_ring = nullptr; aec_ready = false; return;
-    }
+    if (frame != (int)AEC_FRAME_SAMPLES) { ESP_LOGE(TAG, "ESP-SR AEC frame tidak cocok: %d, expected=%u", frame, (unsigned)AEC_FRAME_SAMPLES); aec_destroy(aec_handle); aec_handle = NULL; heap_caps_free(aec_ref_ring); aec_ref_ring = nullptr; aec_ready = false; return; }
     aec_ready = true;
     ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s ref_delay=%ums", aec_get_mode_string(config.mode), frame, config.sample_rate, config.filter_length, aec_get_nlp_string(config.nlp_level), (unsigned)AEC_REF_DELAY_MS);
 }
