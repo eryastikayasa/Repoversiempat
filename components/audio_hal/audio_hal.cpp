@@ -72,7 +72,7 @@ static void aec_ref_pop(int16_t *dest, size_t samples)
 }
 static void aec_init(void)
 {
-    aec_ref_ring = static_cast<int16_t *>(heap_caps_calloc(AEC_REF_RING_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    aec_ref_ring = static_cast<int16_t *>(heap_caps_calloc(AEC_REF_RING_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!aec_ref_ring) { ESP_LOGE(TAG, "AEC reference ring PSRAM allocation gagal - MIC akan tetap berjalan tanpa AEC"); aec_ready = false; return; }
     aec_config_t config = {};
     config.mic_num = 1; config.ref_num = 1; config.out_num = 1;
