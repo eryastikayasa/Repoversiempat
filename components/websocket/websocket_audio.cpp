@@ -20,11 +20,11 @@ static SemaphoreHandle_t audio_send_mutex = NULL;
 #define AUDIO_OUTPUT_SAMPLE_RATE 24000U
 #define AUDIO_OUTPUT_BYTES_PER_SEC (AUDIO_OUTPUT_SAMPLE_RATE * 2U)
 #define AUDIO_RING_BUFFER_SIZE 32768U
-#define AUDIO_PLAYBACK_PREBUFFER_SIZE 4800U      // Reduced from 9600U (100ms vs 200ms)
+#define AUDIO_PLAYBACK_PREBUFFER_SIZE 9600U
 #define AUDIO_PLAYBACK_WARNING_SIZE 4800U
 #define AUDIO_PLAYBACK_CRITICAL_SIZE 2400U
 #define AUDIO_PLAYBACK_READ_SIZE 2048U
-#define AUDIO_PLAYBACK_READ_WAIT_MS 2            // Reduced from 5
+#define AUDIO_PLAYBACK_READ_WAIT_MS 5
 #define AUDIO_PLAYBACK_TRIGGER_SIZE 1024U
 #define AUDIO_SEND_CHUNK_SIZE 512U
 #define AUDIO_SEND_WAIT_MS 50
@@ -78,7 +78,7 @@ static void audio_playback_task(void *arg)
     uint8_t buffer_level = 0;
     uint32_t playback_generation = 0;
     int64_t last_stats_us = 0;
-    ESP_LOGI(TAG, "Audio playback task: 24kHz PCM16 mono, ring=%u, prebuffer=%u (100ms), warning=%u (100ms), critical=%u (50ms), read=%u, core=%d priority=5", (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_WARNING_SIZE, (unsigned)AUDIO_PLAYBACK_CRITICAL_SIZE, (unsigned)AUDIO_PLAYBACK_READ_SIZE, xPortGetCoreID());
+    ESP_LOGI(TAG, "Audio playback task: 24kHz PCM16 mono, ring=%u, prebuffer=%u (200ms), warning=%u (100ms), critical=%u (50ms), read=%u, core=%d priority=3", (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_WARNING_SIZE, (unsigned)AUDIO_PLAYBACK_CRITICAL_SIZE, (unsigned)AUDIO_PLAYBACK_READ_SIZE, xPortGetCoreID());
     for (;;) {
         if (audio_clear_pending) {
             audio_clear_pending = false;
@@ -127,8 +127,9 @@ static void audio_playback_task(void *arg)
                 ESP_LOGW(TAG, "AUDIO PLAYBACK UNDERRUN: PCM buffer kosong di tengah turn - rebuffer");
                 underrun_reported = true;
             }
-            // Don't reset playback_started - let it try to recover immediately
-            vTaskDelay(pdMS_TO_TICKS(1));
+            playback_started = false;
+            buffer_level = 0;
+            vTaskDelay(pdMS_TO_TICKS(AUDIO_PLAYBACK_READ_WAIT_MS));
             continue;
         }
         size_t received = xStreamBufferReceive(audio_stream, playback_buffer, sizeof(playback_buffer), pdMS_TO_TICKS(AUDIO_PLAYBACK_READ_WAIT_MS));
@@ -165,7 +166,7 @@ bool start_audio_playback(void)
     static StaticStreamBuffer_t stream_buffer_struct;
     audio_stream = xStreamBufferCreateStatic(AUDIO_RING_BUFFER_SIZE, AUDIO_PLAYBACK_TRIGGER_SIZE, buffer_mem, &stream_buffer_struct);
     if (audio_stream == NULL) { ESP_LOGE(TAG, "Gagal membuat static stream buffer"); heap_caps_free(buffer_mem); return false; }
-    BaseType_t result = xTaskCreatePinnedToCore(audio_playback_task, "audio_playback", 4096, NULL, 5, &audio_playback_task_handle, 1);  // Changed priority from 3 to 5
+    BaseType_t result = xTaskCreatePinnedToCore(audio_playback_task, "audio_playback", 4096, NULL, 3, &audio_playback_task_handle, 1);
     if (result != pdPASS) {
         ESP_LOGE(TAG, "Gagal membuat audio_task/playback task: free_internal=%u largest=%u", (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
         vStreamBufferDelete(audio_stream);
@@ -173,7 +174,7 @@ bool start_audio_playback(void)
         audio_playback_task_handle = NULL;
         return false;
     }
-    ESP_LOGI(TAG, "Audio ring buffer siap: %u byte, prebuffer=%u (100ms), warning=%u (100ms), critical=%u (50ms), target=%u B/s, playback core=1 priority=5", (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_WARNING_SIZE, (unsigned)AUDIO_PLAYBACK_CRITICAL_SIZE, (unsigned)AUDIO_OUTPUT_BYTES_PER_SEC);
+    ESP_LOGI(TAG, "Audio ring buffer siap: %u byte, prebuffer=%u (200ms), warning=%u (100ms), critical=%u (50ms), target=%u B/s, playback core=1 priority=3", (unsigned)AUDIO_RING_BUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE, (unsigned)AUDIO_PLAYBACK_WARNING_SIZE, (unsigned)AUDIO_PLAYBACK_CRITICAL_SIZE, (unsigned)AUDIO_OUTPUT_BYTES_PER_SEC);
     return true;
 }
 
