@@ -22,6 +22,7 @@ static i2s_chan_handle_t rx_handle = NULL;
 static i2s_chan_handle_t tx_handle = NULL;
 constexpr size_t AEC_FRAME_SAMPLES = 512;
 constexpr size_t AEC_REF_RING_SAMPLES = 32768;
+constexpr size_t PA_REF_CAPTURE_RING_SAMPLES = 8192;
 constexpr size_t AEC_REF_INITIAL_DELAY_MS = 5;
 constexpr size_t AEC_REF_MAX_DELAY_MS = 20;
 constexpr size_t AEC_REF_INITIAL_DELAY_SAMPLES = (MIC_SAMPLE_RATE * AEC_REF_INITIAL_DELAY_MS) / 1000;
@@ -34,6 +35,11 @@ static size_t aec_ref_last_target_end = 0;
 static size_t aec_ref_delay_samples = AEC_REF_INITIAL_DELAY_SAMPLES;
 static int64_t aec_ref_last_playback_write_us = 0;
 static portMUX_TYPE aec_ref_mux = portMUX_INITIALIZER_UNLOCKED;
+static int16_t pa_ref_capture_ring[PA_REF_CAPTURE_RING_SAMPLES];
+static volatile size_t pa_ref_capture_read = 0;
+static volatile size_t pa_ref_capture_write = 0;
+static volatile uint32_t pa_ref_capture_overruns = 0;
+static portMUX_TYPE pa_ref_capture_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool aec_ready = false;
 static srmodel_list_t *ns_models = nullptr;
 static const esp_nsn_iface_t *ns_iface = nullptr;
@@ -50,9 +56,6 @@ static void aec_ref_push_16k_sample(int16_t sample)
     if (aec_ref_count_locked() > AEC_REF_RING_SAMPLES) aec_ref_read = aec_ref_write - AEC_REF_RING_SAMPLES;
 }
 
-// 24 kHz speaker PCM -> 16 kHz AEC reference. This is a stateful linear
-// interpolator: every 3 input samples produce 2 output samples, with
-// fractional samples preserved across I2S write boundaries.
 static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
 {
     if (!pcm || samples == 0 || !aec_ref_ring) return;
@@ -96,9 +99,53 @@ static void aec_ref_push_silence_samples(size_t samples)
     portEXIT_CRITICAL(&aec_ref_mux);
 }
 
-// Reference is a time signal, not merely a FIFO of received PCM. Preserve
-// real playback gaps as zeros so an 8-second Gemini/network pause does not
-// make the next speaker sample appear immediately adjacent to the old one.
+// Capture the PCM that actually left the I2S TX DMA buffer. This is the
+// closest software reference available on a MAX98357A design without an
+// additional analog feedback wire from the PA/speaker path.
+static bool IRAM_ATTR pa_ref_capture_on_sent(i2s_chan_handle_t handle, i2s_event_data_t *event, void *user_ctx)
+{
+    (void)handle;
+    (void)user_ctx;
+    if (!event || !event->dma_buf || event->size < sizeof(int32_t)) return false;
+
+    const int32_t *dma = static_cast<const int32_t *>(event->dma_buf);
+    size_t samples = event->size / sizeof(int32_t);
+    if (samples > PA_REF_CAPTURE_RING_SAMPLES) samples = PA_REF_CAPTURE_RING_SAMPLES;
+
+    portENTER_CRITICAL_ISR(&pa_ref_capture_mux);
+    for (size_t i = 0; i < samples; ++i) {
+        const size_t next = pa_ref_capture_write % PA_REF_CAPTURE_RING_SAMPLES;
+        pa_ref_capture_ring[next] = static_cast<int16_t>(dma[i] >> 16);
+        ++pa_ref_capture_write;
+        if (pa_ref_capture_write - pa_ref_capture_read > PA_REF_CAPTURE_RING_SAMPLES) {
+            pa_ref_capture_read = pa_ref_capture_write - PA_REF_CAPTURE_RING_SAMPLES;
+            ++pa_ref_capture_overruns;
+        }
+    }
+    portEXIT_CRITICAL_ISR(&pa_ref_capture_mux);
+    return false;
+}
+
+// Drain the ISR capture ring in task context, then resample the exact TX DMA
+// samples into the 16 kHz ESP-SR AEC reference ring.
+static void aec_ref_drain_pa_capture(void)
+{
+    static int16_t chunk[240];
+    for (;;) {
+        size_t n = 0;
+        portENTER_CRITICAL(&pa_ref_capture_mux);
+        const size_t available = pa_ref_capture_write - pa_ref_capture_read;
+        if (available > 0) {
+            n = available > sizeof(chunk) / sizeof(chunk[0]) ? sizeof(chunk) / sizeof(chunk[0]) : available;
+            for (size_t i = 0; i < n; ++i) chunk[i] = pa_ref_capture_ring[(pa_ref_capture_read + i) % PA_REF_CAPTURE_RING_SAMPLES];
+            pa_ref_capture_read += n;
+        }
+        portEXIT_CRITICAL(&pa_ref_capture_mux);
+        if (n == 0) break;
+        aec_ref_push_24k(chunk, n);
+    }
+}
+
 static void aec_ref_sync_playback_gap(void)
 {
     const int64_t now_us = esp_timer_get_time();
@@ -146,7 +193,7 @@ static void aec_init(void)
     int frame = aec_get_chunksize(aec_handle);
     if (frame != (int)AEC_FRAME_SAMPLES) { ESP_LOGE(TAG, "ESP-SR AEC frame tidak cocok: %d, expected=%u", frame, (unsigned)AEC_FRAME_SAMPLES); aec_destroy(aec_handle); aec_handle = NULL; heap_caps_free(aec_ref_ring); aec_ref_ring = nullptr; aec_ready = false; return; }
     aec_ready = true;
-    ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s ref_delay=%ums max=%ums", aec_get_mode_string(config.mode), frame, config.sample_rate, config.filter_length, aec_get_nlp_string(config.nlp_level), (unsigned)AEC_REF_INITIAL_DELAY_MS, (unsigned)AEC_REF_MAX_DELAY_MS);
+    ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s ref_delay=%ums max=%ums PA_REF=I2S_TX_DMA", aec_get_mode_string(config.mode), frame, config.sample_rate, config.filter_length, aec_get_nlp_string(config.nlp_level), (unsigned)AEC_REF_INITIAL_DELAY_MS, (unsigned)AEC_REF_MAX_DELAY_MS);
 }
 
 static void log_audio_heap(const char *stage)
@@ -260,9 +307,12 @@ void audio_hal_init(void)
     tx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO; tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT; tx_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT; tx_cfg.slot_cfg.ws_pol = false; tx_cfg.slot_cfg.bit_shift = true;
     tx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED; tx_cfg.gpio_cfg.bclk = SPK_I2S_BCLK; tx_cfg.gpio_cfg.ws = SPK_I2S_LRCK; tx_cfg.gpio_cfg.dout = SPK_I2S_DOUT; tx_cfg.gpio_cfg.din = I2S_GPIO_UNUSED;
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_cfg));
+    i2s_event_callbacks_t tx_callbacks = {};
+    tx_callbacks.on_sent = pa_ref_capture_on_sent;
+    ESP_ERROR_CHECK(i2s_channel_register_event_callback(tx_handle, &tx_callbacks, nullptr));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle)); ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
     log_audio_heap("after_i2s_init"); aec_init(); log_audio_heap("after_aec_init");
-    ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT", MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
+    ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT, PA_REF=TX_DMA_CAPTURE", MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
 }
 
 void audio_hal_ns_init(void)
@@ -298,6 +348,7 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
     size_t samples = bytes_read / sizeof(int32_t); int16_t *pcm = reinterpret_cast<int16_t *>(dest);
     for (size_t i = 0; i < samples; ++i) pcm[i] = static_cast<int16_t>(raw[i] >> 16);
     if (aec_ready && samples == AEC_FRAME_SAMPLES) {
+        aec_ref_drain_pa_capture();
         memcpy(mic_frame, pcm, sizeof(mic_frame));
         aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES);
         aec_process(aec_handle, mic_frame, ref_frame, clean_frame);
@@ -324,8 +375,6 @@ void audio_write_speaker(const uint8_t *src, size_t len)
     if (!tx_handle || !src || len < 2) return;
     len &= ~((size_t)1);
     static int32_t tx_buffer[1024];
-    static int16_t ref_pcm[512];
-    aec_ref_sync_playback_gap();
     const int16_t *pcm = reinterpret_cast<const int16_t *>(src);
     size_t total = len / sizeof(int16_t), offset = 0;
     constexpr size_t I2S_WRITE_SAMPLES = 240;
@@ -337,10 +386,6 @@ void audio_write_speaker(const uint8_t *src, size_t len)
         size_t written = 0;
         esp_err_t err = i2s_channel_write(tx_handle, tx_buffer, n * sizeof(int32_t), &written, I2S_WRITE_TIMEOUT_MS);
         size_t samples_written = written / sizeof(int32_t); if (samples_written > n) samples_written = n;
-        if (aec_ready && samples_written > 0) {
-            for (size_t i = 0; i < samples_written; ++i) ref_pcm[i] = pcm[old_offset + i];
-            aec_ref_push_24k(ref_pcm, samples_written);
-        }
         offset += samples_written;
         if (err != ESP_OK || samples_written == 0) {
             ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums", esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t)), (unsigned)I2S_WRITE_TIMEOUT_MS);
