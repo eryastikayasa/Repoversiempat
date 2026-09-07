@@ -7,6 +7,7 @@ extern "C" {
 #include "esp_nsn_models.h"
 }
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -94,6 +95,33 @@ static void log_audio_heap(const char *stage)
     size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     ESP_LOGI(TAG, "HEAP[%s]: internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u", stage, (unsigned)internal_free, (unsigned)internal_largest, (unsigned)psram_free, (unsigned)psram_largest);
 }
+static void aec_log_frame_levels(const int16_t *mic, const int16_t *ref, const int16_t *clean, size_t samples)
+{
+    if (!mic || !ref || !clean || samples == 0) return;
+    static int64_t last_log_us = 0;
+    const int64_t now_us = esp_timer_get_time();
+    if (last_log_us != 0 && now_us - last_log_us < 500000) return;
+    last_log_us = now_us;
+    int32_t mic_max = 0, ref_max = 0, clean_max = 0;
+    uint64_t mic_sum = 0, ref_sum = 0, clean_sum = 0;
+    for (size_t i = 0; i < samples; ++i) {
+        int32_t m = mic[i]; if (m < 0) m = -m;
+        int32_t r = ref[i]; if (r < 0) r = -r;
+        int32_t c = clean[i]; if (c < 0) c = -c;
+        if (m > mic_max) mic_max = m;
+        if (r > ref_max) ref_max = r;
+        if (c > clean_max) clean_max = c;
+        mic_sum += (uint32_t)m;
+        ref_sum += (uint32_t)r;
+        clean_sum += (uint32_t)c;
+    }
+    ESP_LOGI(TAG, "AEC LEVEL: mic_raw(avg=%u max=%u) ref(avg=%u max=%u) clean(avg=%u max=%u) ratio_clean_raw=%u/1000 ref_ring=%u samples",
+             (unsigned)(mic_sum / samples), (unsigned)mic_max,
+             (unsigned)(ref_sum / samples), (unsigned)ref_max,
+             (unsigned)(clean_sum / samples), (unsigned)clean_max,
+             mic_sum ? (unsigned)((clean_sum * 1000ULL) / mic_sum) : 0,
+             (unsigned)aec_ref_count_locked());
+}
 void audio_hal_init(void)
 {
     ESP_LOGI(TAG, "Menginisialisasi Audio I2S - proven v6.1.5 / Xiaozhi-compatible...");
@@ -155,6 +183,7 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
         memcpy(mic_frame, pcm, sizeof(mic_frame));
         aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES);
         aec_process(aec_handle, mic_frame, ref_frame, clean_frame);
+        aec_log_frame_levels(mic_frame, ref_frame, clean_frame, AEC_FRAME_SAMPLES);
         memcpy(pcm, clean_frame, sizeof(clean_frame));
     }
     if (ns_ready && samples == AEC_FRAME_SAMPLES) {
