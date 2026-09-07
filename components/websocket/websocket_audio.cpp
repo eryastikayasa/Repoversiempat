@@ -202,7 +202,10 @@ static void audio_playback_task(void *arg)
             underrun_reported = false;
         }
 
-        vTaskDelay(1);
+        // Do not delay after a successful I2S write. i2s_channel_write() already
+        // blocks until this audio block has been transmitted. A further tick here
+        // inserts a real gap between consecutive PCM blocks and can sound as
+        // audible stutter/cut-outs.
     }
 }
 
