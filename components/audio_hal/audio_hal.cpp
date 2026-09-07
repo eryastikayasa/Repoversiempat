@@ -140,8 +140,8 @@ static void aec_log_alignment(const int16_t *mic, const int16_t *ref, size_t sam
 
     float best_score = 0.0f;
     size_t best_lag = 0;
-    constexpr size_t MAX_LAG_SAMPLES = 320; // 20 ms at 16 kHz
-    constexpr size_t LAG_STEP_SAMPLES = 16;  // 1 ms resolution
+    constexpr size_t MAX_LAG_SAMPLES = 320;
+    constexpr size_t LAG_STEP_SAMPLES = 16;
     for (size_t lag = 0; lag <= MAX_LAG_SAMPLES; lag += LAG_STEP_SAMPLES) {
         const size_t n = samples - lag;
         double dot = 0.0;
@@ -262,7 +262,7 @@ void audio_write_speaker(const uint8_t *src, size_t len)
 }
 void audio_i2s_test_tone(void)
 {
-    static const int16_t sine_table[24] = {0, 2071, 4000, 5657, 6928, 7727, 8000, 7727, 6928, 5657, 4000, 2071, 0, -2071, -4000, -5657, -6928, -7727, -6928, -5657, -4000, -2071};
+    static const int16_t sine_table[24] = {0, 2071, 4000, 5657, 6928, 7727, 8000, 7727, 6928, 5657, 4000, 2071, 0, -2071, -4000, -5657, -6928, -7727, -8000, -6928, -5657, -4000, -2071};
     static int16_t tone[2400];
     if (!tx_handle) return;
     for (size_t i = 0; i < 2400; ++i) tone[i] = sine_table[i % 24];
