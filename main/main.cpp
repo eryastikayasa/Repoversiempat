@@ -172,7 +172,7 @@ static bool debug_dns_resolution(void)
 
 static bool debug_tcp_connection(void)
 {
-    char gemini_ip[INET_ADDRSTRLEN] = {};
+    char gemini_ip[INET6_ADDRSTRLEN] = {};
     if (!resolve_host("Gemini-TCP", "generativelanguage.googleapis.com", "443", gemini_ip, sizeof(gemini_ip))) {
         ESP_LOGE(TAG, "TCP test dihentikan: DNS Gemini gagal");
         return false;
@@ -403,7 +403,12 @@ static void audio_task(void *arg)
             buffer_pos = remainder;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(10));
+        // i2s_channel_read() already blocks until the next RX DMA data is
+        // available. A 10 ms delay here throttled the microphone producer and
+        // could make the realtime input stream fall behind. Keep only one
+        // FreeRTOS tick so the task yields without intentionally inserting
+        // another 10 ms of latency between microphone batches.
+        vTaskDelay(1);
     }
 }
 
