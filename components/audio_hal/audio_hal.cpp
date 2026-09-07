@@ -21,11 +21,14 @@ static i2s_chan_handle_t tx_handle = NULL;
 
 constexpr size_t AEC_FRAME_SAMPLES = 512;
 constexpr size_t AEC_REF_RING_SAMPLES = 32768;
+constexpr size_t AEC_REF_DELAY_MS = 5;
+constexpr size_t AEC_REF_DELAY_SAMPLES = (MIC_SAMPLE_RATE * AEC_REF_DELAY_MS) / 1000;
 
 static aec_handle_t *aec_handle = NULL;
 static int16_t *aec_ref_ring = nullptr;
 static size_t aec_ref_read = 0;
 static size_t aec_ref_write = 0;
+static size_t aec_ref_last_target_end = 0;
 static portMUX_TYPE aec_ref_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool aec_ready = false;
 
@@ -59,14 +62,30 @@ static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
 static void aec_ref_pop(int16_t *dest, size_t samples)
 {
     if (!dest || samples == 0) return;
-    if (!aec_ref_ring) { memset(dest, 0, samples * sizeof(int16_t)); return; }
+    memset(dest, 0, samples * sizeof(int16_t));
+    if (!aec_ref_ring) return;
+
     portENTER_CRITICAL(&aec_ref_mux);
-    size_t available = aec_ref_count_locked();
-    size_t take = available < samples ? available : samples;
-    for (size_t i = 0; i < take; ++i) dest[i] = aec_ref_ring[(aec_ref_read + i) % AEC_REF_RING_SAMPLES];
-    aec_ref_read += take;
+    const size_t write_pos = aec_ref_write;
+
+    // ESP-ADF documents that the AEC recording signal should be delayed
+    // roughly 0-10 ms relative to its playback reference. Keep a fixed,
+    // deterministic reference history instead of consuming the ring at an
+    // emergent task-scheduling-dependent position.
+    if (write_pos >= AEC_REF_DELAY_SAMPLES + samples) {
+        const size_t target_end = write_pos - AEC_REF_DELAY_SAMPLES;
+
+        // If playback has not advanced since the previous frame, do not feed
+        // the AEC the same reference repeatedly. Leave this frame as zeros.
+        if (target_end > aec_ref_last_target_end) {
+            const size_t start = target_end - samples;
+            for (size_t i = 0; i < samples; ++i) {
+                dest[i] = aec_ref_ring[(start + i) % AEC_REF_RING_SAMPLES];
+            }
+            aec_ref_last_target_end = target_end;
+        }
+    }
     portEXIT_CRITICAL(&aec_ref_mux);
-    if (take < samples) memset(dest + take, 0, (samples - take) * sizeof(int16_t));
 }
 
 static void aec_init(void)
@@ -86,7 +105,7 @@ static void aec_init(void)
         aec_destroy(aec_handle); aec_handle = NULL; heap_caps_free(aec_ref_ring); aec_ref_ring = nullptr; aec_ready = false; return;
     }
     aec_ready = true;
-    ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s", aec_get_mode_string(config.mode), frame, config.sample_rate, config.filter_length, aec_get_nlp_string(config.nlp_level));
+    ESP_LOGI(TAG, "ESP-SR AEC READY: mode=%s frame=%d rate=%dHz filter=%d NLP=%s ref_delay=%ums", aec_get_mode_string(config.mode), frame, config.sample_rate, config.filter_length, aec_get_nlp_string(config.nlp_level), (unsigned)AEC_REF_DELAY_MS);
 }
 
 static void log_audio_heap(const char *stage)
