@@ -15,6 +15,7 @@ extern "C" {
 #include <stdint.h>
 #include <stddef.h>
 #include <string.h>
+#include <math.h>
 
 static const char *TAG = "AUDIO_HAL";
 static i2s_chan_handle_t rx_handle = NULL;
@@ -122,6 +123,50 @@ static void aec_log_frame_levels(const int16_t *mic, const int16_t *ref, const i
              mic_sum ? (unsigned)((clean_sum * 1000ULL) / mic_sum) : 0,
              (unsigned)aec_ref_count_locked());
 }
+static void aec_log_alignment(const int16_t *mic, const int16_t *ref, size_t samples)
+{
+    if (!mic || !ref || samples < 64) return;
+    static int64_t last_log_us = 0;
+    const int64_t now_us = esp_timer_get_time();
+    if (last_log_us != 0 && now_us - last_log_us < 1000000) return;
+    last_log_us = now_us;
+
+    uint64_t ref_sum = 0;
+    for (size_t i = 0; i < samples; ++i) {
+        int32_t v = ref[i]; if (v < 0) v = -v;
+        ref_sum += (uint32_t)v;
+    }
+    if ((ref_sum / samples) < 300) return;
+
+    float best_score = 0.0f;
+    size_t best_lag = 0;
+    constexpr size_t MAX_LAG_SAMPLES = 320; // 20 ms at 16 kHz
+    constexpr size_t LAG_STEP_SAMPLES = 16;  // 1 ms resolution
+    for (size_t lag = 0; lag <= MAX_LAG_SAMPLES; lag += LAG_STEP_SAMPLES) {
+        const size_t n = samples - lag;
+        double dot = 0.0;
+        double mic_energy = 0.0;
+        double ref_energy = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            const double m = (double)mic[i + lag];
+            const double r = (double)ref[i];
+            dot += m * r;
+            mic_energy += m * m;
+            ref_energy += r * r;
+        }
+        if (mic_energy <= 0.0 || ref_energy <= 0.0) continue;
+        const float score = (float)(fabs(dot) / sqrt(mic_energy * ref_energy));
+        if (score > best_score) {
+            best_score = score;
+            best_lag = lag;
+        }
+    }
+    ESP_LOGI(TAG, "AEC ALIGN: best_lag=%ums corr=%u/1000 current_ref_delay=%ums ref_avg=%u",
+             (unsigned)(best_lag * 1000 / MIC_SAMPLE_RATE),
+             (unsigned)(best_score * 1000.0f),
+             (unsigned)AEC_REF_DELAY_MS,
+             (unsigned)(ref_sum / samples));
+}
 void audio_hal_init(void)
 {
     ESP_LOGI(TAG, "Menginisialisasi Audio I2S - proven v6.1.5 / Xiaozhi-compatible...");
@@ -140,8 +185,7 @@ void audio_hal_init(void)
     i2s_std_config_t tx_cfg = {};
     tx_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SPK_SAMPLE_RATE);
     tx_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
-    tx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO; tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-    tx_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT; tx_cfg.slot_cfg.ws_pol = false; tx_cfg.slot_cfg.bit_shift = true;
+    tx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO; tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT; tx_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT; tx_cfg.slot_cfg.ws_pol = false; tx_cfg.slot_cfg.bit_shift = true;
     tx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED; tx_cfg.gpio_cfg.bclk = SPK_I2S_BCLK; tx_cfg.gpio_cfg.ws = SPK_I2S_LRCK; tx_cfg.gpio_cfg.dout = SPK_I2S_DOUT; tx_cfg.gpio_cfg.din = I2S_GPIO_UNUSED;
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle)); ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
@@ -184,6 +228,7 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
         aec_ref_pop(ref_frame, AEC_FRAME_SAMPLES);
         aec_process(aec_handle, mic_frame, ref_frame, clean_frame);
         aec_log_frame_levels(mic_frame, ref_frame, clean_frame, AEC_FRAME_SAMPLES);
+        aec_log_alignment(mic_frame, ref_frame, AEC_FRAME_SAMPLES);
         memcpy(pcm, clean_frame, sizeof(clean_frame));
     }
     if (ns_ready && samples == AEC_FRAME_SAMPLES) {
@@ -217,7 +262,7 @@ void audio_write_speaker(const uint8_t *src, size_t len)
 }
 void audio_i2s_test_tone(void)
 {
-    static const int16_t sine_table[24] = {0, 2071, 4000, 5657, 6928, 7727, 8000, 7727, 6928, 5657, 4000, 2071, 0, -2071, -4000, -5657, -6928, -7727, -8000, -6928, -5657, -4000, -2071};
+    static const int16_t sine_table[24] = {0, 2071, 4000, 5657, 6928, 7727, 8000, 7727, 6928, 5657, 4000, 2071, 0, -2071, -4000, -5657, -6928, -7727, -6928, -5657, -4000, -2071};
     static int16_t tone[2400];
     if (!tx_handle) return;
     for (size_t i = 0; i < 2400; ++i) tone[i] = sine_table[i % 24];
