@@ -32,6 +32,7 @@ static size_t aec_ref_read = 0;
 static size_t aec_ref_write = 0;
 static size_t aec_ref_last_target_end = 0;
 static size_t aec_ref_delay_samples = AEC_REF_INITIAL_DELAY_SAMPLES;
+static int64_t aec_ref_last_playback_write_us = 0;
 static portMUX_TYPE aec_ref_mux = portMUX_INITIALIZER_UNLOCKED;
 static bool aec_ready = false;
 static srmodel_list_t *ns_models = nullptr;
@@ -49,8 +50,9 @@ static void aec_ref_push_16k_sample(int16_t sample)
     if (aec_ref_count_locked() > AEC_REF_RING_SAMPLES) aec_ref_read = aec_ref_write - AEC_REF_RING_SAMPLES;
 }
 
-// The speaker path is 24 kHz while ESP-SR AEC is 16 kHz. Use stateful
-// linear interpolation instead of selecting 2 samples out of every 3.
+// 24 kHz speaker PCM -> 16 kHz AEC reference. This is a stateful linear
+// interpolator: every 3 input samples produce 2 output samples, with
+// fractional samples preserved across I2S write boundaries.
 static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
 {
     if (!pcm || samples == 0 || !aec_ref_ring) return;
@@ -66,11 +68,11 @@ static void aec_ref_push_24k(const int16_t *pcm, size_t samples)
         if (!have_prev) {
             prev = cur;
             have_prev = true;
-            next_output_half = 3; // first new output at 1.5 input samples
+            aec_ref_push_16k_sample(cur);
+            next_output_half = 3;
             continue;
         }
 
-        // Output positions are 1.5 input samples apart: 1.5, 3.0, 4.5 ...
         const uint64_t cur_half = idx * 2;
         if (cur_half >= next_output_half) {
             const uint64_t prev_half = (idx - 1) * 2;
@@ -94,34 +96,21 @@ static void aec_ref_push_silence_samples(size_t samples)
     portEXIT_CRITICAL(&aec_ref_mux);
 }
 
-// Keep the reference timeline tied to wall-clock playback. If Gemini pauses
-// between PCM packets, those missing playback samples must appear as zeros in
-// the AEC reference instead of collapsing the timeline.
+// Reference is a time signal, not merely a FIFO of received PCM. Preserve
+// real playback gaps as zeros so an 8-second Gemini/network pause does not
+// make the next speaker sample appear immediately adjacent to the old one.
 static void aec_ref_sync_playback_gap(void)
 {
-    static int64_t last_write_us = 0;
     const int64_t now_us = esp_timer_get_time();
-    if (last_write_us == 0) {
-        last_write_us = now_us;
-        return;
-    }
+    const int64_t last_us = aec_ref_last_playback_write_us;
+    if (last_us == 0) return;
 
-    const int64_t elapsed_us = now_us - last_write_us;
-    if (elapsed_us <= 12000) return;
+    const int64_t elapsed_us = now_us - last_us;
+    if (elapsed_us <= 2000) return;
 
-    const int64_t gap_us = elapsed_us - 10000;
-    size_t gap_samples = (size_t)((gap_us * MIC_SAMPLE_RATE) / 1000000LL);
+    size_t gap_samples = (size_t)((elapsed_us * MIC_SAMPLE_RATE) / 1000000LL);
     if (gap_samples > AEC_REF_RING_SAMPLES / 2) gap_samples = AEC_REF_RING_SAMPLES / 2;
     if (gap_samples > 0) aec_ref_push_silence_samples(gap_samples);
-    last_write_us = now_us;
-}
-
-static void aec_ref_mark_playback_write_complete(void)
-{
-    static int64_t *last_write_us_ptr = nullptr;
-    (void)last_write_us_ptr;
-    // The gap synchronizer owns its timestamp; this function intentionally
-    // remains empty so reference samples are timestamped at write boundaries.
 }
 
 static void aec_ref_pop(int16_t *dest, size_t samples)
@@ -187,19 +176,19 @@ static void aec_log_frame_levels(const int16_t *mic, const int16_t *ref, const i
         if (c > clean_max) clean_max = c;
         mic_sum += (uint32_t)m; ref_sum += (uint32_t)r; clean_sum += (uint32_t)c;
     }
-    size_t ring_count;
-    portENTER_CRITICAL(&aec_ref_mux); ring_count = aec_ref_count_locked(); portEXIT_CRITICAL(&aec_ref_mux);
+    size_t ring_count, delay_samples;
+    portENTER_CRITICAL(&aec_ref_mux); ring_count = aec_ref_count_locked(); delay_samples = aec_ref_delay_samples; portEXIT_CRITICAL(&aec_ref_mux);
     ESP_LOGI(TAG, "AEC LEVEL: mic_raw(avg=%u max=%u) ref(avg=%u max=%u) clean(avg=%u max=%u) ratio_clean_raw=%u/1000 ref_ring=%u samples ref_delay=%ums",
              (unsigned)(mic_sum / samples), (unsigned)mic_max, (unsigned)(ref_sum / samples), (unsigned)ref_max,
              (unsigned)(clean_sum / samples), (unsigned)clean_max, mic_sum ? (unsigned)((clean_sum * 1000ULL) / mic_sum) : 0,
-             (unsigned)ring_count, (unsigned)((aec_ref_delay_samples * 1000) / MIC_SAMPLE_RATE));
+             (unsigned)ring_count, (unsigned)((delay_samples * 1000) / MIC_SAMPLE_RATE));
 }
 
 static void aec_log_alignment_and_adapt(const int16_t *mic, const int16_t *ref, size_t samples)
 {
     if (!mic || !ref || samples < 64) return;
     static int64_t last_log_us = 0;
-    static size_t stable_delay = AEC_REF_INITIAL_DELAY_SAMPLES;
+    static size_t candidate_delay = AEC_REF_INITIAL_DELAY_SAMPLES;
     static unsigned stable_hits = 0;
     const int64_t now_us = esp_timer_get_time();
     if (last_log_us != 0 && now_us - last_log_us < 1000000) return;
@@ -229,16 +218,13 @@ static void aec_log_alignment_and_adapt(const int16_t *mic, const int16_t *ref, 
     size_t current_delay;
     portENTER_CRITICAL(&aec_ref_mux); current_delay = aec_ref_delay_samples; portEXIT_CRITICAL(&aec_ref_mux);
     const size_t suggested = current_delay + best_lag;
-    size_t target = suggested > AEC_REF_MAX_DELAY_SAMPLES ? AEC_REF_MAX_DELAY_SAMPLES : suggested;
+    const size_t target = suggested > AEC_REF_MAX_DELAY_SAMPLES ? AEC_REF_MAX_DELAY_SAMPLES : suggested;
     const bool reliable = best_score >= 0.55f && best_lag <= (AEC_REF_MAX_DELAY_SAMPLES / 2);
     if (reliable && target != current_delay) {
-        if (target > stable_delay + 16 || target + 16 < stable_delay) { stable_delay = target; stable_hits = 1; }
-        else { stable_hits++; }
+        if (candidate_delay > target + 16 || target > candidate_delay + 16) { candidate_delay = target; stable_hits = 1; }
+        else ++stable_hits;
         if (stable_hits >= 3) {
-            portENTER_CRITICAL(&aec_ref_mux);
-            aec_ref_delay_samples = stable_delay;
-            aec_ref_last_target_end = 0;
-            portEXIT_CRITICAL(&aec_ref_mux);
+            portENTER_CRITICAL(&aec_ref_mux); aec_ref_delay_samples = candidate_delay; portEXIT_CRITICAL(&aec_ref_mux);
             stable_hits = 0;
         }
     } else {
@@ -361,6 +347,7 @@ void audio_write_speaker(const uint8_t *src, size_t len)
             vTaskDelay(1); return;
         }
     }
+    aec_ref_last_playback_write_us = esp_timer_get_time();
 }
 
 void audio_i2s_test_tone(void)
