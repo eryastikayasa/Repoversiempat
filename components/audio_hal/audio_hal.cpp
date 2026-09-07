@@ -415,7 +415,7 @@ void audio_write_speaker(const uint8_t *src, size_t len)
     const int16_t *pcm = reinterpret_cast<const int16_t *>(src);
     size_t total = len / sizeof(int16_t), offset = 0;
     constexpr size_t I2S_WRITE_SAMPLES = 240;
-    constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 100;  // Increased from 50ms
+    constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
 
     while (offset < total) {
         const size_t old_offset = offset;
@@ -428,19 +428,26 @@ void audio_write_speaker(const uint8_t *src, size_t len)
         esp_err_t err = i2s_channel_write(tx_handle, tx_buffer, n * sizeof(int32_t), &written, I2S_WRITE_TIMEOUT_MS);
         size_t samples_written = written / sizeof(int32_t);
         if (samples_written > n) samples_written = n;
-        offset += samples_written;
-
+        
+        // Only advance offset if write succeeded
         if (samples_written > 0) {
+            offset += samples_written;
+            // AEC reference tracking ONLY for successfully written samples
             memcpy(ref_pcm, pcm + old_offset, samples_written * sizeof(int16_t));
             aec_ref_push_24k(ref_pcm, samples_written);
         }
 
-        if (err != ESP_OK || samples_written == 0) {
-            ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums",
-                     esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t)),
-                     (unsigned)I2S_WRITE_TIMEOUT_MS);
-            vTaskDelay(1);
-            return;
+        // Fail on error OR partial write
+        if (err != ESP_OK || samples_written != n) {
+            if (err != ESP_OK || samples_written == 0) {
+                ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums",
+                         esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t)),
+                         (unsigned)I2S_WRITE_TIMEOUT_MS);
+                vTaskDelay(1);
+                return;
+            }
+            // Partial write - continue loop to retry remaining
+            continue;
         }
     }
 }
