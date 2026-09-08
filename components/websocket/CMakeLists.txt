@@ -6,7 +6,6 @@ idf_component_register(
         "websocket_rx_ingest.cpp"
         "websocket_rx_state.cpp"
         "websocket_json.cpp"
-        "websocket_audio.cpp"
         "websocket_tx.cpp"
         "websocket_tool.cpp"
         "websocket_stack_wrap.c"
