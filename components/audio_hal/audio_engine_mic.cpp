@@ -48,7 +48,7 @@ static void capture_task(void *arg)
     static uint8_t frame_buffer[MIC_FRAME_BYTES];
     size_t frame_pos = 0;
 
-    ESP_LOGI(TAG, "Mic capture owner aktif: PCM16 16kHz, frame=%uB, idle=%ums",
+    ESP_LOGI(TAG, "Mic capture owner aktif: PCM16 16kHz, frame=%uB, idle=%ums, stack=8192",
              (unsigned)MIC_FRAME_BYTES, (unsigned)MIC_IDLE_TIMEOUT_MS);
 
     for (;;) {
@@ -112,7 +112,7 @@ bool audio_engine_start_capture(void)
     if (s_capture_started) return true;
 
     BaseType_t rc = xTaskCreatePinnedToCore(
-        capture_task, "audio_capture", 4096, nullptr, 5, &s_capture_task, 1);
+        capture_task, "audio_capture", 8192, nullptr, 5, &s_capture_task, 1);
     if (rc != pdPASS) {
         s_capture_task = nullptr;
         ESP_LOGE(TAG, "Gagal membuat AudioEngine capture task");
