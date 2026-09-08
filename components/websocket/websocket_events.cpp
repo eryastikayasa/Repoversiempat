@@ -86,6 +86,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
             request_audio_buffer_clear();
+            (void)websocket_rx_ingest_init();
             display_status("AI Terhubung...");
             websocket_schedule_setup(websocket_connection_generation);
             break;
