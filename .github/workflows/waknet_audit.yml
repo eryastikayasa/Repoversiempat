@@ -12,10 +12,6 @@ permissions:
   contents: read
   actions: read
 
-concurrency:
-  group: wakenet-audit-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   audit:
     name: Verify WakeNet9 Hi ESP
