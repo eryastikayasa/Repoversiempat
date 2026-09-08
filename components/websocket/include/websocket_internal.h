@@ -21,6 +21,8 @@
 #define WS_TX_AUDIO_SIZE 3200
 #define WS_TX_QUEUE_LENGTH 3
 #define WS_RX_QUEUE_LENGTH WS_RX_SLOT_COUNT
+/* Temporary compatibility alias; remove after websocket_audio.cpp cleanup. */
+#define AUDIO_PLAYBACK_PLAYBACK_CRITICAL_SIZE AUDIO_PLAYBACK_CRITICAL_SIZE
 
 typedef enum { WS_TX_COMMAND_SETUP = 1, WS_TX_COMMAND_AUDIO = 2 } ws_tx_command_type_t;
 typedef struct { ws_tx_command_type_t type; uint32_t generation; uint16_t len; uint8_t *data; } ws_tx_command_t;
