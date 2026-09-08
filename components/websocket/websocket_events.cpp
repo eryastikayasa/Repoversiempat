@@ -1,6 +1,7 @@
 #include "websocket_internal.h"
 #include "display.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "esp_websocket_client.h"
 
 #include <stdint.h>
@@ -10,6 +11,10 @@ static const char *TAG = "WS_EVENT";
 static volatile bool lifecycle_invalidated = false;
 static volatile bool websocket_cleanup_pending = false;
 static volatile bool websocket_finish_received = false;
+
+/* Audio supply timeline: measures callback-to-callback gap and how long
+ * websocket_rx_enqueue_data() keeps the WebSocket event callback busy. */
+static int64_t ws_audio_last_event_us = 0;
 
 static void invalidate_connection_generation(void)
 {
@@ -70,6 +75,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             lifecycle_invalidated = false;
             websocket_cleanup_pending = false;
             websocket_finish_received = false;
+            ws_audio_last_event_us = 0;
             is_connected = true;
             setup_complete = false;
             websocket_tx_error = false;
@@ -94,7 +100,41 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             }
             if ((data->op_code == 0x00 || data->op_code == 0x01 || data->op_code == 0x02) &&
                 data->data_ptr && data->data_len > 0) {
-                (void)websocket_rx_enqueue_data(data, websocket_connection_generation);
+
+                const int64_t event_start_us = esp_timer_get_time();
+                const int64_t event_gap_ms =
+                    (ws_audio_last_event_us > 0)
+                        ? (event_start_us - ws_audio_last_event_us) / 1000LL
+                        : -1LL;
+
+                (void)websocket_rx_enqueue_data(
+                    data,
+                    websocket_connection_generation
+                );
+
+                const int64_t callback_ms =
+                    (esp_timer_get_time() - event_start_us) / 1000LL;
+
+                ws_audio_last_event_us = esp_timer_get_time();
+
+                /* Keep normal traffic quiet. Only report timing large enough
+                 * to plausibly explain an audio starvation event. */
+                if (event_gap_ms >= 30LL || callback_ms >= 30LL) {
+                    ESP_LOGW(
+                        TAG,
+                        "AUDIO WS TIMELINE: "
+                        "event_gap=%lldms "
+                        "callback=%lldms "
+                        "frag=%d "
+                        "payload=%d "
+                        "offset=%d",
+                        (long long)event_gap_ms,
+                        (long long)callback_ms,
+                        (int)data->data_len,
+                        (int)data->payload_len,
+                        (int)data->payload_offset
+                    );
+                }
             }
             break;
 
