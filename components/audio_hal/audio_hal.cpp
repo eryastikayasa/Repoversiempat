@@ -124,7 +124,7 @@ static void aec_ref_pop(int16_t *dest, size_t samples)
 
 static void aec_init(void)
 { 
-    esp_log_level_set(TAG, ESP_LOG_WARN);
+    
     aec_ref_ring = static_cast<int16_t *>(heap_caps_calloc(
         AEC_REF_RING_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!aec_ref_ring) {
@@ -292,7 +292,8 @@ static void aec_log_alignment_and_adapt(const int16_t *mic, const int16_t *ref, 
 }
 
 void audio_hal_init(void)
-{
+{ 
+    esp_log_level_set(TAG, ESP_LOG_WARN);
     ESP_LOGI(TAG, "Menginisialisasi Audio I2S - proven v6.1.5 / Xiaozhi-compatible...");
 
     i2s_chan_config_t tx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
