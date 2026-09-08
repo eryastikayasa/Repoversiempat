@@ -406,52 +406,104 @@ size_t audio_read_mic(uint8_t *dest, size_t max_len)
     return samples * sizeof(int16_t);
 }
 
-void audio_write_speaker(const uint8_t *src, size_t len)
+size_t audio_write_speaker(const uint8_t *src, size_t len)
 {
-    if (!tx_handle || !src || len < 2) return;
+    if (!tx_handle || !src || len < 2)
+        return 0;
+
     len &= ~((size_t)1);
+
     static int32_t tx_buffer[1024];
     static int16_t ref_pcm[240];
-    const int16_t *pcm = reinterpret_cast<const int16_t *>(src);
-    size_t total = len / sizeof(int16_t), offset = 0;
+
+    const int16_t *pcm =
+        reinterpret_cast<const int16_t *>(src);
+
+    const size_t total = len / sizeof(int16_t);
+    size_t offset = 0;
+
     constexpr size_t I2S_WRITE_SAMPLES = 240;
     constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
 
     while (offset < total) {
         const size_t old_offset = offset;
-        size_t n = total - offset;
-        if (n > I2S_WRITE_SAMPLES) n = I2S_WRITE_SAMPLES;
-        for (size_t i = 0; i < n; ++i)
-            tx_buffer[i] = static_cast<int32_t>(pcm[old_offset + i]) << 16;
 
-        size_t written = 0;
-        esp_err_t err = i2s_channel_write(tx_handle, tx_buffer, n * sizeof(int32_t), &written, I2S_WRITE_TIMEOUT_MS);
-        size_t samples_written = written / sizeof(int32_t);
-        if (samples_written > n) samples_written = n;
-        
-        // Only advance offset if write succeeded
-        if (samples_written > 0) {
-            offset += samples_written;
-            // AEC reference tracking ONLY for successfully written samples
-            memcpy(ref_pcm, pcm + old_offset, samples_written * sizeof(int16_t));
-            aec_ref_push_24k(ref_pcm, samples_written);
+        size_t n = total - offset;
+        if (n > I2S_WRITE_SAMPLES)
+            n = I2S_WRITE_SAMPLES;
+
+        for (size_t i = 0; i < n; ++i) {
+            tx_buffer[i] =
+                static_cast<int32_t>(
+                    pcm[old_offset + i]
+                ) << 16;
         }
 
-        // Fail on error OR partial write
+        size_t written = 0;
+
+        esp_err_t err = i2s_channel_write(
+            tx_handle,
+            tx_buffer,
+            n * sizeof(int32_t),
+            &written,
+            I2S_WRITE_TIMEOUT_MS
+        );
+
+        size_t samples_written =
+            written / sizeof(int32_t);
+
+        if (samples_written > n)
+            samples_written = n;
+
+        /*
+         * Hanya sample yang benar-benar diterima
+         * oleh I2S yang dimasukkan ke AEC reference.
+         */
+        if (samples_written > 0) {
+            offset += samples_written;
+
+            memcpy(
+                ref_pcm,
+                pcm + old_offset,
+                samples_written * sizeof(int16_t)
+            );
+
+            aec_ref_push_24k(
+                ref_pcm,
+                samples_written
+            );
+        }
+
         if (err != ESP_OK || samples_written != n) {
+
             if (err != ESP_OK || samples_written == 0) {
-                ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums",
-                         esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t)),
-                         (unsigned)I2S_WRITE_TIMEOUT_MS);
+                ESP_LOGW(
+                    TAG,
+                    "I2S speaker write fail: err=%s written=%u/%u",
+                    esp_err_to_name(err),
+                    (unsigned)written,
+                    (unsigned)(n * sizeof(int32_t))
+                );
+
                 vTaskDelay(1);
-                return;
+
+                /*
+                 * Return jumlah PCM16 yang benar-benar
+                 * berhasil ditulis ke I2S.
+                 */
+                return offset * sizeof(int16_t);
             }
-            // Partial write - continue loop to retry remaining
+
+            /*
+             * Partial write:
+             * lanjutkan sampai chunk selesai.
+             */
             continue;
         }
     }
-}
 
+    return offset * sizeof(int16_t);
+}
 void audio_i2s_test_tone(void)
 {
     static const int16_t sine_table[24] = {
