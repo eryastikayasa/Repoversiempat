@@ -316,7 +316,7 @@ static void audio_task(void *arg)
                         if (magnitude > max_abs) max_abs = magnitude;
                     }
                 }
-                ESP_LOGI("WAKE_DEBUG", "buffer_pos=%u max_abs=%ld detect_calls=%d last_result=%d chunk_samples=%d bytes_read=%u",
+                ESP_LOGD("WAKE_DEBUG", "buffer_pos=%u max_abs=%ld detect_calls=%d last_result=%d chunk_samples=%d bytes_read=%u",
                          (unsigned)buffer_pos, (long)max_abs, detect_calls, last_wake_result,
                          wake_chunk_samples, (unsigned)bytes_read);
             }
