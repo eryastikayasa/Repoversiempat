@@ -23,21 +23,15 @@ uint64_t audio_bytes_playback_dropped = 0;
 
 #define AUDIO_OUTPUT_SAMPLE_RATE       24000U
 #define AUDIO_OUTPUT_BYTES_PER_SEC     (AUDIO_OUTPUT_SAMPLE_RATE * 2U)
-
 #define AUDIO_RING_BUFFER_SIZE         32768U
-
-#define AUDIO_PLAYBACK_PREBUFFER_SIZE  9600U
+#define AUDIO_PLAYBACK_PREBUFFER_SIZE  16384U
 #define AUDIO_PLAYBACK_WARNING_SIZE    4800U
 #define AUDIO_PLAYBACK_CRITICAL_SIZE   2400U
-
 #define AUDIO_PLAYBACK_READ_SIZE       2048U
 #define AUDIO_PLAYBACK_READ_WAIT_MS    5
-
 #define AUDIO_PLAYBACK_TRIGGER_SIZE    1024U
-
 #define AUDIO_SEND_CHUNK_SIZE          512U
 #define AUDIO_SEND_WAIT_MS             50
-
 #define AUDIO_I2S_DRAIN_MS             20
 
 /* -------------------------------------------------------------------------- */
