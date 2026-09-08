@@ -6,7 +6,6 @@
 
 static const char *TAG = "AUDIO_ENGINE";
 
-/* Gemini Live output: PCM16 mono at 24 kHz. */
 static constexpr uint32_t ENGINE_OUTPUT_SAMPLE_RATE = 24000U;
 static constexpr uint32_t ENGINE_OUTPUT_BYTES_PER_SEC = ENGINE_OUTPUT_SAMPLE_RATE * 2U;
 static constexpr size_t ENGINE_PREBUFFER_BYTES = 128U * 1024U;
@@ -64,7 +63,7 @@ static void sync_task(void *arg)
 
     for (;;) {
         audio_engine_sync_legacy_state();
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
@@ -75,8 +74,7 @@ bool audio_engine_init(void)
     s_last_generation = websocket_connection_generation;
     reset_turn(s_last_generation);
 
-    BaseType_t rc = xTaskCreate(
-        sync_task, "audio_engine", 3072, nullptr, 4, &s_task);
+    BaseType_t rc = xTaskCreate(sync_task, "audio_engine", 3072, nullptr, 4, &s_task);
     if (rc != pdPASS) {
         s_state = AUDIO_ENGINE_ERROR;
         s_task = nullptr;
@@ -97,7 +95,10 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
 {
     if (!s_initialized) return;
 
-    if (generation != 0 && generation != s_turn.generation) {
+    const uint32_t connection_generation = websocket_connection_generation;
+    if (generation == 0) generation = connection_generation;
+
+    if (generation != s_turn.generation) {
         reset_turn(generation);
         s_last_generation = generation;
         audio_turn_active = false;
@@ -107,11 +108,15 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
 
     switch (event) {
         case AUDIO_ENGINE_EVENT_MODEL_BEGIN:
+            if (s_turn.model_complete || s_state == AUDIO_ENGINE_COMPLETE || s_state == AUDIO_ENGINE_INTERRUPTED)
+                reset_turn(generation);
             s_turn.model_started = true;
+            s_turn.model_complete = false;
+            s_turn.playback_started = false;
+            s_turn.playback_drained = false;
             audio_turn_active = true;
             audio_turn_complete_pending = false;
-            if (s_state == AUDIO_ENGINE_IDLE || s_state == AUDIO_ENGINE_LISTENING || s_state == AUDIO_ENGINE_THINKING)
-                set_state(AUDIO_ENGINE_BUFFERING);
+            set_state(AUDIO_ENGINE_BUFFERING);
             break;
 
         case AUDIO_ENGINE_EVENT_MODEL_AUDIO:
@@ -124,8 +129,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
         case AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE:
             s_turn.model_complete = true;
             audio_turn_complete_pending = true;
-            if (s_state == AUDIO_ENGINE_PLAYING || s_state == AUDIO_ENGINE_PLAYING_LOW || s_state == AUDIO_ENGINE_BUFFERING)
-                set_state(AUDIO_ENGINE_DRAINING);
+            set_state(AUDIO_ENGINE_DRAINING);
             break;
 
         case AUDIO_ENGINE_EVENT_PLAYBACK_STARTED:
@@ -148,6 +152,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
                 audio_turn_complete_pending = false;
                 audio_turn_active = false;
                 set_state(AUDIO_ENGINE_COMPLETE);
+                face_set_state(FACE_LISTENING);
                 set_state(AUDIO_ENGINE_IDLE);
             }
             break;
@@ -157,7 +162,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
             audio_turn_active = false;
             request_audio_buffer_clear();
             set_state(AUDIO_ENGINE_INTERRUPTED);
-            reset_turn(s_turn.generation);
+            reset_turn(generation);
             break;
 
         case AUDIO_ENGINE_EVENT_GENERATION_CHANGED:
@@ -180,15 +185,15 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
 
 void audio_engine_note_audio(size_t bytes)
 {
-    (void)bytes;
     if (!s_initialized) return;
+    s_turn.bytes_queued += bytes;
     s_turn.pending_bytes = get_audio_pending_bytes();
 }
 
 void audio_engine_note_playback(size_t bytes)
 {
-    (void)bytes;
     if (!s_initialized) return;
+    s_turn.bytes_played += bytes;
     s_turn.pending_bytes = get_audio_pending_bytes();
 }
 
@@ -204,12 +209,7 @@ void audio_engine_sync_legacy_state(void)
 
     const uint32_t generation = websocket_connection_generation;
     if (generation != s_last_generation) {
-        s_last_generation = generation;
-        reset_turn(generation);
-        audio_turn_active = false;
-        audio_turn_complete_pending = false;
-        request_audio_buffer_clear();
-        set_state(AUDIO_ENGINE_IDLE);
+        audio_engine_notify(AUDIO_ENGINE_EVENT_GENERATION_CHANGED, generation);
         return;
     }
 
@@ -224,26 +224,7 @@ void audio_engine_sync_legacy_state(void)
     if (audio_turn_complete_pending)
         s_turn.model_complete = true;
 
-    if (s_turn.model_complete) {
-        if (s_turn.pending_bytes > 0) {
-            set_state(AUDIO_ENGINE_DRAINING);
-        } else if (s_state != AUDIO_ENGINE_COMPLETE && s_state != AUDIO_ENGINE_IDLE) {
-            /* Existing playback completion owns the physical I2S drain. */
-            set_state(AUDIO_ENGINE_COMPLETE);
-            set_state(AUDIO_ENGINE_IDLE);
-        }
-        return;
-    }
-
-    if (audio_turn_active) {
-        if (s_turn.pending_bytes >= ENGINE_PREBUFFER_BYTES && s_state != AUDIO_ENGINE_PLAYING && s_state != AUDIO_ENGINE_PLAYING_LOW)
-            set_state(AUDIO_ENGINE_PLAYING);
-        else if (s_turn.pending_bytes > 0 && s_state == AUDIO_ENGINE_IDLE)
-            set_state(AUDIO_ENGINE_BUFFERING);
-
-        if (s_state == AUDIO_ENGINE_PLAYING && s_turn.pending_bytes < ENGINE_CRITICAL_BYTES)
-            set_state(AUDIO_ENGINE_PLAYING_LOW);
-        else if (s_state == AUDIO_ENGINE_PLAYING_LOW && s_turn.pending_bytes >= ENGINE_WARNING_BYTES)
-            set_state(AUDIO_ENGINE_PLAYING);
-    }
+    /* Compatibility telemetry only. Playback completion is event-driven. */
+    if (s_turn.model_complete && s_turn.pending_bytes > 0)
+        set_state(AUDIO_ENGINE_DRAINING);
 }
