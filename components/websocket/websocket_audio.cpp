@@ -68,7 +68,11 @@ size_t get_audio_pending_bytes(void)
 
 void check_audio_playback_complete(void)
 {
-    if (!audio_turn_complete_pending || audio_stream == NULL) return;
+    const audio_engine_turn_t *turn = audio_engine_get_turn();
+    const bool model_complete = turn != NULL &&
+                                turn->generation == websocket_connection_generation &&
+                                turn->model_complete;
+    if (!model_complete || audio_stream == NULL) return;
 
     if (xStreamBufferBytesAvailable(audio_stream) != 0) {
         audio_drain_deadline_us = 0;
@@ -103,7 +107,6 @@ void check_audio_playback_complete(void)
              (long long)playback_balance);
 
     /* Transitional compatibility: AudioEngine now owns the lifecycle state. */
-    audio_turn_complete_pending = false;
     audio_turn_active = false;
 }
 
@@ -143,7 +146,6 @@ static void audio_playback_task(void *arg)
             if (audio_stream != NULL) xStreamBufferReset(audio_stream);
             if (audio_send_mutex != NULL) xSemaphoreGive(audio_send_mutex);
 
-            audio_turn_complete_pending = false;
             audio_turn_active = false;
             audio_drain_deadline_us = 0;
             audio_last_queue_us = 0;
@@ -183,7 +185,7 @@ static void audio_playback_task(void *arg)
 
             uint8_t new_level = 0;
             if (pending >= AUDIO_PLAYBACK_WARNING_SIZE) new_level = 3;
-            else if (pending >= AUDIO_PLAYBACK_CRITICAL_SIZE) new_level = 2;
+            else if (pending >= AUDIO_PLAYBACK_PLAYBACK_CRITICAL_SIZE) new_level = 2;
             else if (pending > 0) new_level = 1;
 
             if (new_level != buffer_level) {
@@ -203,12 +205,17 @@ static void audio_playback_task(void *arg)
             audio_low_since_us = 0;
         }
 
-        if (!playback_started && pending < AUDIO_PLAYBACK_PREBUFFER_SIZE && audio_turn_active && !audio_turn_complete_pending) {
+        const audio_engine_turn_t *turn = audio_engine_get_turn();
+        const bool model_complete = turn != NULL &&
+                                    turn->generation == websocket_connection_generation &&
+                                    turn->model_complete;
+
+        if (!playback_started && pending < AUDIO_PLAYBACK_PREBUFFER_SIZE && audio_turn_active && !model_complete) {
             vTaskDelay(1);
             continue;
         }
 
-        if (playback_started && pending == 0 && audio_turn_active && !audio_turn_complete_pending) {
+        if (playback_started && pending == 0 && audio_turn_active && !model_complete) {
             if (!underrun_reported) {
                 const int64_t now_us = esp_timer_get_time();
                 const int64_t input_gap_ms = audio_last_queue_us > 0 ? (now_us - audio_last_queue_us) / 1000LL : -1LL;
@@ -352,7 +359,6 @@ void clear_audio_buffer(void)
     if (audio_stream != NULL) xStreamBufferReset(audio_stream);
     if (audio_send_mutex != NULL) xSemaphoreGive(audio_send_mutex);
 
-    audio_turn_complete_pending = false;
     audio_turn_active = false;
     audio_drain_deadline_us = 0;
     audio_last_queue_us = 0;
@@ -372,7 +378,6 @@ void reset_audio_turn_stats(void)
     audio_received_accounted = 0;
     audio_chunks_accounted = 0;
     audio_turn_active = false;
-    audio_turn_complete_pending = false;
     audio_drain_deadline_us = 0;
     audio_last_queue_us = 0;
     audio_low_since_us = 0;
@@ -409,7 +414,6 @@ void begin_audio_turn(void)
     if (next_generation == 0U) next_generation = 1U;
     audio_turn_generation = next_generation;
     audio_turn_active = true;
-    audio_turn_complete_pending = false;
 
     audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_BEGIN, websocket_connection_generation);
 }
