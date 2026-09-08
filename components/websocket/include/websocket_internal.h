@@ -1,5 +1,6 @@
 #pragma once
 #include "websocket_mgr.h"
+#include "audio_engine.h"
 #include "esp_websocket_client.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
