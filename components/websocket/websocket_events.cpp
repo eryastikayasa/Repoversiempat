@@ -1,5 +1,5 @@
 #include "websocket_internal.h"
-#include "display.h"
+#include "display.h" 
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
