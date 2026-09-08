@@ -54,10 +54,6 @@ bool build_gemini_setup(char **output, size_t *output_len);
 void clear_session_handle(void);
 bool store_session_handle(const char *handle);
 
-/* Legacy telemetry symbols are now defined by AudioEngine only. */
-extern uint32_t audio_chunks_received;
-extern uint64_t audio_bytes_received;
-
 void websocket_disconnect(void);
 void websocket_reset_started(void);
 bool websocket_cleanup_is_pending(void);
