@@ -123,7 +123,8 @@ static void aec_ref_pop(int16_t *dest, size_t samples)
 }
 
 static void aec_init(void)
-{
+{ 
+    esp_log_level_set(TAG, ESP_LOG_WARN);
     aec_ref_ring = static_cast<int16_t *>(heap_caps_calloc(
         AEC_REF_RING_SAMPLES, sizeof(int16_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT));
     if (!aec_ref_ring) {
