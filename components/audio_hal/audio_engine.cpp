@@ -7,7 +7,6 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/stream_buffer.h"
-#include "freertos/semphr.h"
 
 #include <string.h>
 
@@ -22,8 +21,21 @@ static constexpr size_t ENGINE_WARNING_BYTES = 64U * 1024U;
 static constexpr size_t ENGINE_CRITICAL_BYTES = 32U * 1024U;
 static constexpr size_t ENGINE_PLAYBACK_READ_SIZE = 1024U;
 static constexpr size_t ENGINE_SEND_CHUNK_SIZE = 1024U;
-static constexpr TickType_t ENGINE_BUFFER_SEND_WAIT = pdMS_TO_TICKS(20);
 static constexpr uint32_t ENGINE_I2S_DRAIN_MS = 20U;
+
+/*
+ * StreamBuffer is deliberately used as a non-blocking SPSC pipe:
+ *   writer = websocket RX worker
+ *   reader = AudioEngine playback task
+ *
+ * The old implementation put a mutex around both Send() and Receive() and
+ * then allowed Send() to block for 20 ms while the reader also needed the
+ * mutex. When the ring was full, the reader could not drain it until the
+ * writer timed out. That created artificial RX gaps and audio underruns.
+ * Both sides now use zero block time, so no task can hold an audio lock while
+ * waiting for the other side. Clear/reset is also safe because no stream call
+ * can remain blocked.
+ */
 
 static volatile bool s_initialized = false;
 static volatile bool s_clear_pending = false;
@@ -31,8 +43,6 @@ static volatile audio_engine_state_t s_state = AUDIO_ENGINE_IDLE;
 static audio_engine_turn_t s_turn = {};
 static TaskHandle_t s_task = nullptr;
 static StreamBufferHandle_t s_stream = nullptr;
-static SemaphoreHandle_t s_stream_mutex = nullptr;
-static StaticSemaphore_t s_stream_mutex_storage;
 static int64_t s_drain_deadline_us = 0;
 static int64_t s_last_queue_us = 0;
 static int64_t s_low_since_us = 0;
@@ -67,23 +77,13 @@ static void set_state(audio_engine_state_t next)
 
 static void reset_turn(uint32_t generation)
 {
-    s_turn = {};
+    memset(&s_turn, 0, sizeof(s_turn));
     s_turn.generation = generation;
-}
-
-static size_t pending_bytes_locked(void)
-{
-    return s_stream ? xStreamBufferBytesAvailable(s_stream) : 0;
 }
 
 static size_t pending_bytes(void)
 {
-    if (!s_stream) return 0;
-    if (s_stream_mutex && xSemaphoreTake(s_stream_mutex, pdMS_TO_TICKS(10)) != pdTRUE)
-        return xStreamBufferBytesAvailable(s_stream);
-    const size_t pending = pending_bytes_locked();
-    if (s_stream_mutex) xSemaphoreGive(s_stream_mutex);
-    return pending;
+    return s_stream ? xStreamBufferBytesAvailable(s_stream) : 0;
 }
 
 static void reset_playback_timeline(void)
@@ -95,16 +95,9 @@ static void reset_playback_timeline(void)
     s_buffer_level = 0;
 }
 
-static void reset_buffer_locked(void)
+static void reset_buffer_internal(void)
 {
     if (s_stream) xStreamBufferReset(s_stream);
-}
-
-static void clear_buffer_internal(void)
-{
-    if (s_stream_mutex) xSemaphoreTake(s_stream_mutex, portMAX_DELAY);
-    reset_buffer_locked();
-    if (s_stream_mutex) xSemaphoreGive(s_stream_mutex);
     reset_playback_timeline();
 }
 
@@ -122,12 +115,12 @@ static void update_buffer_level(size_t pending, bool turn_active)
         s_low_since_us = 0;
     }
 
-    uint8_t level = 0; /* EMPTY */
-    if (pending >= ENGINE_RING_BUFFER_SIZE) level = 5; /* FULL */
-    else if (pending >= ENGINE_PREBUFFER_BYTES) level = 4; /* HIGH/TARGET */
-    else if (pending >= ENGINE_WARNING_BYTES) level = 3; /* TARGET */
-    else if (pending >= ENGINE_CRITICAL_BYTES) level = 2; /* LOW */
-    else if (pending > 0) level = 1; /* CRITICAL */
+    uint8_t level = 0;
+    if (pending >= ENGINE_RING_BUFFER_SIZE) level = 5;
+    else if (pending >= ENGINE_PREBUFFER_BYTES) level = 4;
+    else if (pending >= ENGINE_WARNING_BYTES) level = 3;
+    else if (pending >= ENGINE_CRITICAL_BYTES) level = 2;
+    else if (pending > 0) level = 1;
 
     if (level == s_buffer_level) return;
     s_buffer_level = level;
@@ -153,14 +146,11 @@ static bool ensure_buffer(void)
 {
     if (s_stream) return true;
 
-    if (!s_stream_mutex) {
-        s_stream_mutex = xSemaphoreCreateMutexStatic(&s_stream_mutex_storage);
-        if (!s_stream_mutex) return false;
-    }
-
-    s_buffer_mem = (uint8_t *)heap_caps_malloc(ENGINE_RING_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    s_buffer_mem = (uint8_t *)heap_caps_malloc(
+        ENGINE_RING_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (!s_buffer_mem)
-        s_buffer_mem = (uint8_t *)heap_caps_malloc(ENGINE_RING_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        s_buffer_mem = (uint8_t *)heap_caps_malloc(
+            ENGINE_RING_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
     if (!s_buffer_mem) {
         ESP_LOGE(TAG, "Gagal alokasi audio ring %u byte", (unsigned)ENGINE_RING_BUFFER_SIZE);
         return false;
@@ -241,7 +231,7 @@ static void playback_task(void *arg)
     for (;;) {
         if (s_clear_pending) {
             s_clear_pending = false;
-            clear_buffer_internal();
+            reset_buffer_internal();
             playback_started = false;
             underrun_reported = false;
         }
@@ -277,7 +267,7 @@ static void playback_task(void *arg)
                          (unsigned long long)s_turn.bytes_played,
                          (unsigned long long)s_turn.network_drop,
                          (unsigned long long)s_turn.playback_drop);
-                s_turn.underrun_count++;
+                ++s_turn.underrun_count;
                 underrun_reported = true;
             }
             playback_started = false;
@@ -286,13 +276,8 @@ static void playback_task(void *arg)
             continue;
         }
 
-        size_t received = 0;
-        if (s_stream_mutex && xSemaphoreTake(s_stream_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            received = xStreamBufferReceive(s_stream, playback_buffer, sizeof(playback_buffer), 0);
-            xSemaphoreGive(s_stream_mutex);
-        } else if (!s_stream_mutex) {
-            received = xStreamBufferReceive(s_stream, playback_buffer, sizeof(playback_buffer), 0);
-        }
+        size_t received = xStreamBufferReceive(
+            s_stream, playback_buffer, sizeof(playback_buffer), 0);
 
         if (received == 0) {
             finish_playback_if_drained(pending_bytes());
@@ -395,14 +380,14 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
     if (!s_initialized) return;
 
     if (event == AUDIO_ENGINE_EVENT_GENERATION_CHANGED) {
-        clear_buffer_internal();
+        reset_buffer_internal();
         reset_turn(generation);
         set_state(AUDIO_ENGINE_IDLE);
         return;
     }
 
     if (generation != 0 && s_turn.generation != 0 && generation != s_turn.generation) {
-        clear_buffer_internal();
+        reset_buffer_internal();
         reset_turn(generation);
         set_state(AUDIO_ENGINE_IDLE);
     } else if (s_turn.generation == 0 && generation != 0) {
@@ -445,15 +430,12 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
             break;
 
         case AUDIO_ENGINE_EVENT_PLAYBACK_DRAINED:
-            s_turn.playback_drained = true;
-            break;
-
         case AUDIO_ENGINE_EVENT_I2S_DRAINED:
             s_turn.playback_drained = true;
             break;
 
         case AUDIO_ENGINE_EVENT_INTERRUPT:
-            clear_buffer_internal();
+            reset_buffer_internal();
             set_state(AUDIO_ENGINE_INTERRUPTED);
             reset_turn(generation);
             break;
@@ -472,14 +454,14 @@ void audio_engine_begin_turn(uint32_t generation)
     if (!s_initialized) return;
     if (generation == 0) generation = s_turn.generation;
 
-    clear_buffer_internal();
+    reset_buffer_internal();
     reset_turn(generation);
     set_state(AUDIO_ENGINE_BUFFERING);
 }
 
 bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t generation)
 {
-    if (!s_initialized || !pcm || len == 0) return false;
+    if (!s_initialized || !pcm || len == 0 || !s_stream) return false;
     len &= ~((size_t)1);
     if (len == 0) return false;
 
@@ -506,27 +488,22 @@ bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t gene
     }
     s_last_queue_us = now_us;
     s_last_queue_len = len;
-
     s_turn.bytes_received += len;
 
     size_t offset = 0;
     while (offset < len) {
         size_t chunk = len - offset;
         if (chunk > ENGINE_SEND_CHUNK_SIZE) chunk = ENGINE_SEND_CHUNK_SIZE;
-        if (chunk & 1U) chunk--;
+        chunk &= ~((size_t)1);
         if (chunk == 0) break;
 
-        size_t written = 0;
-        if (s_stream_mutex && xSemaphoreTake(s_stream_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-            written = xStreamBufferSend(s_stream, pcm + offset, chunk, ENGINE_BUFFER_SEND_WAIT);
-            xSemaphoreGive(s_stream_mutex);
-        }
-        if (written > 0) {
-            s_turn.bytes_queued += written;
-            offset += written;
-        } else {
-            break;
-        }
+        /* Never wait for playback here. A full ring is an explicit drop. */
+        const size_t written = xStreamBufferSend(
+            s_stream, pcm + offset, chunk, 0);
+        if (written == 0) break;
+
+        s_turn.bytes_queued += written;
+        offset += written;
     }
 
     if (offset < len) {
@@ -546,7 +523,7 @@ bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t gene
 void audio_engine_clear_buffer(void)
 {
     if (!s_initialized) return;
-    clear_buffer_internal();
+    reset_buffer_internal();
     s_turn.pending_bytes = 0;
 }
 
@@ -559,9 +536,8 @@ void audio_engine_reset_turn_stats(void)
 {
     if (!s_initialized) return;
     const uint32_t generation = s_turn.generation;
+    reset_buffer_internal();
     reset_turn(generation);
-    reset_playback_timeline();
-    clear_buffer_internal();
 }
 
 size_t audio_engine_get_pending_bytes(void)
@@ -579,7 +555,7 @@ void audio_engine_note_playback(size_t bytes)
 void audio_engine_note_underrun(void)
 {
     if (!s_initialized) return;
-    s_turn.underrun_count++;
+    ++s_turn.underrun_count;
 }
 
 /* Compatibility aliases: ownership remains entirely inside AudioEngine. */
