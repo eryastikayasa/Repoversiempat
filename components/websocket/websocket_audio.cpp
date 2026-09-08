@@ -40,10 +40,31 @@ uint64_t audio_bytes_playback_dropped = 0;
 
 #define AUDIO_I2S_DRAIN_MS             20
 
+/* -------------------------------------------------------------------------- */
+/* Audio turn state                                                           */
+/* -------------------------------------------------------------------------- */
+
 static volatile uint32_t audio_turn_generation = 0;
 static int64_t audio_drain_deadline_us = 0;
+
 static uint64_t audio_received_accounted = 0;
 static uint32_t audio_chunks_accounted = 0;
+
+
+/* -------------------------------------------------------------------------- */
+/* Underrun timeline measurement                                              */
+/*                                                                            */
+/* Tujuan:                                                                    */
+/* 1. Mengukur gap antar PCM yang masuk ke ring.                              */
+/* 2. Mengukur berapa lama buffer berada di bawah prebuffer.                  */
+/* 3. Mengetahui kondisi tepat saat underrun.                                 */
+/*                                                                            */
+/* Tidak mengubah mekanisme playback.                                         */
+/* -------------------------------------------------------------------------- */
+
+static int64_t audio_last_queue_us = 0;
+static int64_t audio_low_since_us = 0;
+static size_t audio_last_queue_len = 0;
 
 
 /* -------------------------------------------------------------------------- */
@@ -304,6 +325,11 @@ static void audio_playback_task(void *arg)
 
             audio_drain_deadline_us = 0;
 
+            /* Reset underrun timeline state */
+            audio_last_queue_us = 0;
+            audio_low_since_us = 0;
+            audio_last_queue_len = 0;
+
             playback_started = false;
             underrun_reported = false;
             buffer_level = 0;
@@ -327,6 +353,14 @@ static void audio_playback_task(void *arg)
             buffer_level = 0;
 
             audio_drain_deadline_us = 0;
+
+            /*
+             * Jangan membawa timeline dari turn sebelumnya
+             * ke turn baru.
+             */
+            audio_last_queue_us = 0;
+            audio_low_since_us = 0;
+            audio_last_queue_len = 0;
         }
 
 
@@ -343,6 +377,35 @@ static void audio_playback_task(void *arg)
 
         size_t pending =
             xStreamBufferBytesAvailable(audio_stream);
+
+
+        /* -------------------------------------------------------------- */
+        /* Timeline: buffer low-state                                      */
+        /* -------------------------------------------------------------- */
+
+        /*
+         * Kita mulai stopwatch ketika pending berada
+         * di bawah target prebuffer 9600 byte.
+         *
+         * Ini hanya pengukuran, tidak mengubah playback.
+         */
+        if (audio_turn_active) {
+
+            if (pending < AUDIO_PLAYBACK_PREBUFFER_SIZE) {
+
+                if (audio_low_since_us == 0) {
+                    audio_low_since_us = esp_timer_get_time();
+                }
+
+            } else {
+
+                audio_low_since_us = 0;
+            }
+        }
+        else {
+
+            audio_low_since_us = 0;
+        }
 
 
         /* -------------------------------------------------------------- */
@@ -427,10 +490,56 @@ static void audio_playback_task(void *arg)
 
             if (!underrun_reported) {
 
+                const int64_t now_us =
+                    esp_timer_get_time();
+
+                /*
+                 * Berapa lama sejak PCM terakhir masuk.
+                 *
+                 * Ini sangat penting:
+                 *
+                 * input_gap besar
+                 *     -> kemungkinan supply/RX terlambat
+                 *
+                 * input_gap kecil
+                 *     -> data sebenarnya baru saja masuk,
+                 *        perlu audit scheduling/queue/playback.
+                 */
+                const int64_t input_gap_ms =
+                    (audio_last_queue_us > 0)
+                        ? (now_us - audio_last_queue_us) / 1000LL
+                        : -1LL;
+
+                /*
+                 * Berapa lama buffer berada di bawah
+                 * prebuffer 9600 byte sebelum underrun.
+                 */
+                const int64_t low_for_ms =
+                    (audio_low_since_us > 0)
+                        ? (now_us - audio_low_since_us) / 1000LL
+                        : 0LL;
+
                 ESP_LOGW(
                     TAG,
-                    "AUDIO PLAYBACK UNDERRUN: "
-                    "PCM buffer kosong di tengah turn - rebuffer"
+                    "AUDIO UNDERRUN TIMELINE: "
+                    "input_gap=%lldms "
+                    "low_for=%lldms "
+                    "pending=%u "
+                    "last_queue=%u "
+                    "rx=%llu "
+                    "queued=%llu "
+                    "played=%llu "
+                    "net_drop=%llu "
+                    "play_drop=%llu",
+                    (long long)input_gap_ms,
+                    (long long)low_for_ms,
+                    (unsigned)pending,
+                    (unsigned)audio_last_queue_len,
+                    (unsigned long long)audio_bytes_received,
+                    (unsigned long long)audio_bytes_queued,
+                    (unsigned long long)audio_bytes_played,
+                    (unsigned long long)audio_bytes_dropped,
+                    (unsigned long long)audio_bytes_playback_dropped
                 );
 
                 underrun_reported = true;
@@ -581,6 +690,10 @@ static void audio_playback_task(void *arg)
             playback_started = false;
             underrun_reported = false;
             buffer_level = 0;
+
+            audio_last_queue_us = 0;
+            audio_low_since_us = 0;
+            audio_last_queue_len = 0;
         }
     }
 }
@@ -761,6 +874,11 @@ void clear_audio_buffer(void)
     audio_turn_active = false;
 
     audio_drain_deadline_us = 0;
+
+    /* Reset underrun timeline state */
+    audio_last_queue_us = 0;
+    audio_low_since_us = 0;
+    audio_last_queue_len = 0;
 }
 
 
@@ -789,6 +907,11 @@ void reset_audio_turn_stats(void)
     audio_turn_complete_pending = false;
 
     audio_drain_deadline_us = 0;
+
+    /* Reset underrun timeline state */
+    audio_last_queue_us = 0;
+    audio_low_since_us = 0;
+    audio_last_queue_len = 0;
 }
 
 
@@ -818,6 +941,13 @@ void begin_audio_turn(void)
     audio_chunks_accounted = 0;
 
     audio_drain_deadline_us = 0;
+
+    /*
+     * Reset timeline untuk turn baru.
+     */
+    audio_last_queue_us = 0;
+    audio_low_since_us = 0;
+    audio_last_queue_len = 0;
 
 
     /*
@@ -922,12 +1052,77 @@ bool queue_audio_pcm(
 
 
     begin_audio_turn();
+
+    /*
+     * --------------------------------------------------------------
+     * Timeline measurement
+     * --------------------------------------------------------------
+     *
+     * Catat waktu setiap PCM chunk masuk.
+     *
+     * Kita hanya log jika gap >= 30 ms.
+     * Tujuannya mencari jeda supply PCM yang cukup panjang
+     * untuk menguras playback ring.
+     */
+
+    const int64_t now_us =
+        esp_timer_get_time();
+
+    if (audio_last_queue_us != 0) {
+
+        const int64_t gap_us =
+            now_us - audio_last_queue_us;
+
+        if (gap_us >= 30000LL) {
+
+            ESP_LOGW(
+                TAG,
+                "AUDIO INPUT GAP: "
+                "gap=%lldms "
+                "len=%u "
+                "pending=%u "
+                "rx=%llu "
+                "queued=%llu "
+                "played=%llu",
+                (long long)(gap_us / 1000LL),
+                (unsigned)len,
+                (unsigned)xStreamBufferBytesAvailable(
+                    audio_stream
+                ),
+                (unsigned long long)audio_bytes_received,
+                (unsigned long long)audio_bytes_queued,
+                (unsigned long long)audio_bytes_played
+            );
+        }
+    }
+
+    audio_last_queue_us = now_us;
+    audio_last_queue_len = len;
+
+
+    /*
+     * Accounting authoritative:
+     *
+     * queue_audio_pcm() menjadi sumber kebenaran
+     * untuk received/chunks.
+     *
+     * Caller lama masih mungkin melakukan:
+     *
+     *   audio_bytes_received += ...
+     *   audio_chunks_received++;
+     *
+     * begin_audio_turn() di atas bisa mereset nilai tersebut.
+     * Karena itu accounting di sini ditulis kembali
+     * menggunakan panjang PCM yang sudah dinormalisasi genap.
+     */
     audio_received_accounted += len;
     audio_chunks_accounted++;
 
-    audio_bytes_received = audio_received_accounted;
-    audio_chunks_received = audio_chunks_accounted;
-    
+    audio_bytes_received =
+        audio_received_accounted;
+
+    audio_chunks_received =
+        audio_chunks_accounted;
 
 
     uint64_t queued_before =
