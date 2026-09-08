@@ -1,5 +1,5 @@
 #include "websocket_internal.h"
-#include "display.h" 
+#include "display.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
@@ -11,9 +11,6 @@ static const char *TAG = "WS_EVENT";
 static volatile bool lifecycle_invalidated = false;
 static volatile bool websocket_cleanup_pending = false;
 static volatile bool websocket_finish_received = false;
-
-/* Audio supply timeline: measures callback-to-callback gap. The callback
- * itself now only copies the transport fragment into the RX ingest queue. */
 static int64_t ws_audio_last_event_us = 0;
 
 static void invalidate_connection_generation(void)
@@ -23,6 +20,8 @@ static void invalidate_connection_generation(void)
     websocket_connection_generation = websocket_connection_generation + 1;
     ESP_LOGW(TAG, "Connection generation invalidated: %lu",
              (unsigned long)websocket_connection_generation);
+    audio_engine_notify(AUDIO_ENGINE_EVENT_GENERATION_CHANGED,
+                        websocket_connection_generation);
 }
 
 static void log_close_diagnostics(const char *event_name, const esp_websocket_event_data_t *data)
@@ -82,10 +81,12 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_connection_generation = websocket_connection_generation + 1;
             ESP_LOGI(TAG, "Connection generation=%lu",
                      (unsigned long)websocket_connection_generation);
+            audio_engine_notify(AUDIO_ENGINE_EVENT_GENERATION_CHANGED,
+                                websocket_connection_generation);
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
-            request_audio_buffer_clear();
+            audio_engine_request_clear();
             (void)websocket_rx_ingest_init();
             display_status("AI Terhubung...");
             websocket_schedule_setup(websocket_connection_generation);
@@ -101,42 +102,29 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             }
             if ((data->op_code == 0x00 || data->op_code == 0x01 || data->op_code == 0x02) &&
                 data->data_ptr && data->data_len > 0) {
-
                 const int64_t event_start_us = esp_timer_get_time();
                 const int64_t event_gap_ms =
                     (ws_audio_last_event_us > 0)
                         ? (event_start_us - ws_audio_last_event_us) / 1000LL
                         : -1LL;
 
-                /* IMPORTANT: do not parse/decode/queue PCM in the WebSocket
-                 * callback. The ingest worker owns that work now. */
+                /* WebSocket callback only hands transport fragments to RX worker. */
                 (void)websocket_rx_ingest_enqueue(
                     data,
-                    websocket_connection_generation
-                );
+                    websocket_connection_generation);
 
                 const int64_t callback_ms =
                     (esp_timer_get_time() - event_start_us) / 1000LL;
-
                 ws_audio_last_event_us = esp_timer_get_time();
 
-                /* Keep normal traffic quiet. Only report timing large enough
-                 * to plausibly explain an audio starvation event. */
                 if (event_gap_ms >= 1000LL || callback_ms >= 1000LL) {
-                    ESP_LOGW(
-                        TAG,
-                        "AUDIO WS TIMELINE: "
-                        "event_gap=%lldms "
-                        "callback=%lldms "
-                        "frag=%d "
-                        "payload=%d "
-                        "offset=%d",
-                        (long long)event_gap_ms,
-                        (long long)callback_ms,
-                        (int)data->data_len,
-                        (int)data->payload_len,
-                        (int)data->payload_offset
-                    );
+                    ESP_LOGW(TAG,
+                             "AUDIO WS TIMELINE: event_gap=%lldms callback=%lldms frag=%d payload=%d offset=%d",
+                             (long long)event_gap_ms,
+                             (long long)callback_ms,
+                             (int)data->data_len,
+                             (int)data->payload_len,
+                             (int)data->payload_offset);
                 }
             }
             break;
@@ -145,8 +133,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             ESP_LOGE(TAG, "WebSocket Error!");
             if (data) {
                 ESP_LOGE(TAG,
-                         "WS error_type=%d sock_errno=%d tls_esp_err=0x%x "
-                         "tls_stack_err=0x%x handshake=%d close_status=%d",
+                         "WS error_type=%d sock_errno=%d tls_esp_err=0x%x tls_stack_err=0x%x handshake=%d close_status=%d",
                          (int)data->error_handle.error_type,
                          data->error_handle.esp_transport_sock_errno,
                          (unsigned)data->error_handle.esp_tls_last_esp_err,
@@ -164,7 +151,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
-            request_audio_buffer_clear();
+            audio_engine_request_clear();
             websocket_cleanup_pending = true;
             break;
 
@@ -178,7 +165,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
-            request_audio_buffer_clear();
+            audio_engine_request_clear();
             display_status("AI Disconnected");
             if (session_resumable && session_handle[0] != '\0')
                 ESP_LOGI(TAG, "Session resumption handle dipertahankan");
@@ -195,7 +182,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
-            request_audio_buffer_clear();
+            audio_engine_request_clear();
             websocket_cleanup_pending = true;
             break;
 
