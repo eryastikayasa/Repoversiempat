@@ -3,6 +3,7 @@ idf_component_register(
         "websocket_mgr.cpp"
         "websocket_events.cpp"
         "websocket_rx.cpp"
+        "websocket_rx_ingest.cpp"
         "websocket_json.cpp"
         "websocket_audio.cpp"
         "websocket_tx.cpp"
