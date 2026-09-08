@@ -27,7 +27,6 @@ bool session_resumable = false;
 
 StreamBufferHandle_t audio_stream = NULL;
 TaskHandle_t audio_playback_task_handle = NULL;
-volatile bool audio_turn_active = false;
 uint32_t audio_chunks_received = 0;
 uint64_t audio_bytes_received = 0;
 uint64_t audio_bytes_queued = 0;
