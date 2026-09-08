@@ -2,7 +2,7 @@ idf_component_register(
     SRCS
         "websocket_mgr.cpp"
         "websocket_events.cpp"
-        "websocket_rx.cpp"
+        "websocket_rx_transport.cpp"
         "websocket_rx_ingest.cpp"
         "websocket_rx_state.cpp"
         "websocket_json.cpp"
