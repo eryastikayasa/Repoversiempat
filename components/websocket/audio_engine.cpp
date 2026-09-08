@@ -155,6 +155,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
         case AUDIO_ENGINE_EVENT_INTERRUPT:
             audio_turn_complete_pending = false;
             audio_turn_active = false;
+            request_audio_buffer_clear();
             set_state(AUDIO_ENGINE_INTERRUPTED);
             reset_turn(s_turn.generation);
             break;
@@ -164,6 +165,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
             s_last_generation = generation;
             audio_turn_complete_pending = false;
             audio_turn_active = false;
+            request_audio_buffer_clear();
             set_state(AUDIO_ENGINE_IDLE);
             break;
 
@@ -206,6 +208,7 @@ void audio_engine_sync_legacy_state(void)
         reset_turn(generation);
         audio_turn_active = false;
         audio_turn_complete_pending = false;
+        request_audio_buffer_clear();
         set_state(AUDIO_ENGINE_IDLE);
         return;
     }
