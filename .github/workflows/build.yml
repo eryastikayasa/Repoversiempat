@@ -10,10 +10,6 @@ on:
       - main
   workflow_dispatch:
 
-concurrency:
-  group: firmware-build-${{ github.ref }}
-  cancel-in-progress: true
-
 jobs:
   build:
     name: Build ESP32-S3 Firmware
@@ -88,7 +84,7 @@ jobs:
           PACKER="$PWD/scripts/pack_model.py"
           test -f "$PACKER"
           MODEL_SRC="$RUNNER_TEMP/esp-sr-v2.4.5/model/wakenet_model/wn9_hiesp"
-          NS_MODEL_SRC="$RUNNER_TEMP/esp-sr-v2.4.5/model/nsnet2"
+          NS_MODEL_SRC="$RUNNER_TEMP/esp-sr-v2.4.5/model/nsnet_model/nsnet2"
           test -d "$MODEL_SRC"
           test -s "$MODEL_SRC/wn9_index"
           test -s "$MODEL_SRC/wn9_data"
