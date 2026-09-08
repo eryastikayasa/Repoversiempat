@@ -297,6 +297,7 @@ static void audio_task(void *arg)
     int64_t last_activity_debug_us = 0;
     static int last_wake_result = 0;
     static int detect_calls = 0;
+    static int reconnect_attempts = 0;
 
     while (1) {
         size_t bytes_read = audio_read_mic(audio_buffer + buffer_pos, sizeof(audio_buffer) - buffer_pos);
@@ -356,6 +357,7 @@ static void audio_task(void *arg)
                     last_user_activity_us = connect_start_us;
                     face_set_state(FACE_HAPPY);
                     websocket_app_start();
+                    reconnect_attempts = 0;
                 }
             }
 
@@ -363,17 +365,27 @@ static void audio_task(void *arg)
             continue;
         }
 
-        if (!websocket_is_connected()) {
-            if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) {
-                ESP_LOGW(TAG, "Koneksi gagal. Kembali ke mode sleep.");
-                assistant_active = false;
-                face_set_state(FACE_SLEEP);
-                buffer_pos = 0;
-                continue;
-            }
+        if (!websocket_is_connected())  { 
+        if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) {
+        if (reconnect_attempts < 5) {
+            int delay_sec = 2 << reconnect_attempts; // 2,4,8,16,32 detik
+            ESP_LOGW(TAG, "Reconnect attempt %d in %d sec...", reconnect_attempts + 1, delay_sec);
+            vTaskDelay(pdMS_TO_TICKS(delay_sec * 1000));
+            websocket_app_start(); // mulai ulang koneksi
+            connect_start_us = esp_timer_get_time();
+            reconnect_attempts++;
+        } else {
+            ESP_LOGW(TAG, "Reconnect gagal, kembali ke mode sleep.");
+            assistant_active = false;
+            face_set_state(FACE_SLEEP);
+            reconnect_attempts = 0;
             buffer_pos = 0;
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
+        }
+    } else {
+        // masih menunggu dalam 15 detik awal, jangan lakukan apa-apa
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    continue;
         }
 
         // Gemini Live receives the AEC-cleaned microphone continuously.
@@ -381,7 +393,7 @@ static void audio_task(void *arg)
         // the command further as needed, while the server-side AAD handles
         // speech start/end detection. This avoids the old 100 ms local gate
         // that discarded quiet/far-field speech before Gemini could see it.
-        constexpr size_t GEMINI_MIC_CHUNK_BYTES = 640;
+        constexpr size_t GEMINI_MIC_CHUNK_BYTES = 320;
         while (buffer_pos >= GEMINI_MIC_CHUNK_BYTES) {
             bool has_activity = mic_frame_has_activity(audio_buffer, GEMINI_MIC_CHUNK_BYTES);
             if (has_activity) last_user_activity_us = esp_timer_get_time();
