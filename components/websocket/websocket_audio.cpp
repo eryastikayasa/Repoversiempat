@@ -185,7 +185,7 @@ static void audio_playback_task(void *arg)
 
             uint8_t new_level = 0;
             if (pending >= AUDIO_PLAYBACK_WARNING_SIZE) new_level = 3;
-            else if (pending >= AUDIO_PLAYBACK_PLAYBACK_CRITICAL_SIZE) new_level = 2;
+            else if (pending >= AUDIO_PLAYBACK_CRITICAL_SIZE) new_level = 2;
             else if (pending > 0) new_level = 1;
 
             if (new_level != buffer_level) {
