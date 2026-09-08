@@ -36,4 +36,5 @@ void audio_i2s_test_tone(void);
 
 size_t audio_read_mic(uint8_t *dest, size_t max_len);
 
-void audio_write_speaker(const uint8_t *src, size_t len);
+
+size_t audio_write_speaker(const uint8_t *src, size_t len);
