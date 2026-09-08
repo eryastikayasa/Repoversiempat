@@ -217,19 +217,19 @@ static void audio_playback_task(void *arg)
 
     int64_t last_stats_us = 0;
 
-    ESP_LOGI(
-        TAG,
-        "Audio playback task: 24kHz PCM16 mono, "
-        "ring=%u, prebuffer=%u (85ms), "
-        "warning=%u (85ms), critical=%u (50ms), "
-        "read=%u, core=%d priority=5",
-        (unsigned)AUDIO_RING_BUFFER_SIZE,
-        (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE,
-        (unsigned)AUDIO_PLAYBACK_WARNING_SIZE,
-        (unsigned)AUDIO_PLAYBACK_CRITICAL_SIZE,
-        (unsigned)AUDIO_PLAYBACK_READ_SIZE,
-        xPortGetCoreID()
+    ESP_LOGI(TAG, "Audio playback task: %uHz PCM16 mono, ring=%u, prebuffer=%u (%ums), warning=%u (%ums), critical=%u (%ums), read=%u, core=%d priority=5",
+    (unsigned)AUDIO_OUTPUT_SAMPLE_RATE,
+    (unsigned)AUDIO_RING_BUFFER_SIZE,
+    (unsigned)AUDIO_PLAYBACK_PREBUFFER_SIZE,
+    (unsigned)((AUDIO_PLAYBACK_PREBUFFER_SIZE * 1000U) / AUDIO_OUTPUT_BYTES_PER_SEC),
+    (unsigned)AUDIO_PLAYBACK_WARNING_SIZE,
+    (unsigned)((AUDIO_PLAYBACK_WARNING_SIZE * 1000U) / AUDIO_OUTPUT_BYTES_PER_SEC),
+    (unsigned)AUDIO_PLAYBACK_CRITICAL_SIZE,
+    (unsigned)((AUDIO_PLAYBACK_CRITICAL_SIZE * 1000U) / AUDIO_OUTPUT_BYTES_PER_SEC),
+    (unsigned)AUDIO_PLAYBACK_READ_SIZE,
+    xPortGetCoreID()
     );
+    
 
     for (;;) {
 
