@@ -460,7 +460,6 @@ void process_gemini_message(const char *json, size_t len)
             ESP_LOGW(TAG, "Gemini: RESPONSE INTERRUPTED - audio engine reset playback");
             audio_engine_notify(AUDIO_ENGINE_EVENT_INTERRUPT,
                                 websocket_connection_generation);
-            request_audio_buffer_clear();
         }
     }
 
