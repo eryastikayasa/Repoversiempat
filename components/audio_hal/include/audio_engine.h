@@ -53,6 +53,7 @@ typedef struct {
 bool audio_engine_init(void);
 audio_engine_state_t audio_engine_get_state(void);
 const char *audio_engine_state_name(audio_engine_state_t state);
+bool audio_engine_turn_active(void);
 const audio_engine_turn_t *audio_engine_get_turn(void);
 void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation);
 void audio_engine_note_audio(size_t bytes);
