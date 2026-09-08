@@ -28,6 +28,10 @@ bool websocket_tx_init(void); bool websocket_tx_enqueue_audio(const uint8_t *dat
 typedef struct { uint32_t generation; uint8_t *buffer; uint32_t len; uint8_t slot_id; } ws_rx_command_t;
 extern QueueHandle_t websocket_rx_queue; extern TaskHandle_t websocket_rx_task_handle;
 bool websocket_rx_init(void); void websocket_rx_request_reset(void); void websocket_rx_flush_queue(void); bool websocket_rx_enqueue_data(esp_websocket_event_data_t *data, uint32_t generation); void websocket_rx_note_invalid_json(size_t len);
+/* WebSocket callback -> RX ingest queue. The callback only copies the
+ * transport fragment and returns; parsing/base64/audio queueing happens in
+ * a worker task so backpressure cannot stall the WebSocket client task. */
+bool websocket_rx_ingest_init(void); bool websocket_rx_ingest_enqueue(esp_websocket_event_data_t *data, uint32_t generation);
 extern esp_websocket_client_handle_t client; extern volatile bool is_connected; extern volatile bool setup_complete; extern volatile bool websocket_tx_error; extern char session_handle[SESSION_HANDLE_MAX_LEN]; extern bool session_resumable;
 extern StreamBufferHandle_t audio_stream; extern TaskHandle_t audio_playback_task_handle; extern volatile bool audio_turn_active; extern volatile bool audio_turn_complete_pending; extern volatile uint32_t websocket_connection_generation;
 void websocket_schedule_setup(uint32_t generation);
