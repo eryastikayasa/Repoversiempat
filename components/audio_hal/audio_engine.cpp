@@ -5,11 +5,9 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-/* Transitional bridge: AudioEngine lives in audio_hal, while the WebSocket
- * transport still owns these legacy playback/connection symbols. */
+/* Transitional bridge: AudioEngine still reads transport-owned generation and
+ * playback telemetry. Turn lifecycle state itself is owned here. */
 extern volatile uint32_t websocket_connection_generation;
-extern volatile bool audio_turn_active;
-extern volatile bool audio_turn_complete_pending;
 extern uint64_t audio_bytes_received;
 extern uint64_t audio_bytes_queued;
 extern uint64_t audio_bytes_played;
@@ -117,8 +115,6 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
     if (generation != s_turn.generation) {
         reset_turn(generation);
         s_last_generation = generation;
-        audio_turn_active = false;
-        audio_turn_complete_pending = false;
         set_state(AUDIO_ENGINE_IDLE);
     }
 
@@ -130,21 +126,17 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
             s_turn.model_complete = false;
             s_turn.playback_started = false;
             s_turn.playback_drained = false;
-            audio_turn_active = true;
-            audio_turn_complete_pending = false;
             set_state(AUDIO_ENGINE_BUFFERING);
             break;
 
         case AUDIO_ENGINE_EVENT_MODEL_AUDIO:
             s_turn.model_started = true;
-            audio_turn_active = true;
             if (s_state == AUDIO_ENGINE_IDLE || s_state == AUDIO_ENGINE_LISTENING || s_state == AUDIO_ENGINE_THINKING)
                 set_state(AUDIO_ENGINE_BUFFERING);
             break;
 
         case AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE:
             s_turn.model_complete = true;
-            audio_turn_complete_pending = true;
             set_state(AUDIO_ENGINE_DRAINING);
             break;
 
@@ -165,8 +157,6 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
         case AUDIO_ENGINE_EVENT_I2S_DRAINED:
             s_turn.playback_drained = true;
             if (s_turn.model_complete) {
-                audio_turn_complete_pending = false;
-                audio_turn_active = false;
                 set_state(AUDIO_ENGINE_COMPLETE);
                 face_set_state(FACE_LISTENING);
                 set_state(AUDIO_ENGINE_IDLE);
@@ -174,8 +164,6 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
             break;
 
         case AUDIO_ENGINE_EVENT_INTERRUPT:
-            audio_turn_complete_pending = false;
-            audio_turn_active = false;
             request_audio_buffer_clear();
             set_state(AUDIO_ENGINE_INTERRUPTED);
             reset_turn(generation);
@@ -184,8 +172,6 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
         case AUDIO_ENGINE_EVENT_GENERATION_CHANGED:
             reset_turn(generation);
             s_last_generation = generation;
-            audio_turn_complete_pending = false;
-            audio_turn_active = false;
             request_audio_buffer_clear();
             set_state(AUDIO_ENGINE_IDLE);
             break;
@@ -236,9 +222,6 @@ void audio_engine_sync_legacy_state(void)
     s_turn.bytes_played = audio_bytes_played;
     s_turn.network_drop = audio_bytes_dropped;
     s_turn.playback_drop = audio_bytes_playback_dropped;
-
-    if (audio_turn_complete_pending)
-        s_turn.model_complete = true;
 
     /* Compatibility telemetry only. Playback completion is event-driven. */
     if (s_turn.model_complete && s_turn.pending_bytes > 0)
