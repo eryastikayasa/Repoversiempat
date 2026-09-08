@@ -30,6 +30,8 @@ static SemaphoreHandle_t audio_send_mutex = NULL;
 #define AUDIO_SEND_WAIT_MS 50
 static volatile uint32_t audio_turn_generation = 0;
 static size_t send_realtime_pcm(const uint8_t *data, size_t len)
+static int64_t audio_drain_deadline_us = 0;
+constexpr int64_t AUDIO_I2S_DRAIN_MS = 20;
 {
     if (audio_stream == NULL || data == NULL || len == 0) return 0;
     size_t offset = 0;
