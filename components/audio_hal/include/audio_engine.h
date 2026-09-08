@@ -25,10 +25,6 @@ typedef enum {
     AUDIO_ENGINE_EVENT_MODEL_BEGIN,
     AUDIO_ENGINE_EVENT_MODEL_AUDIO,
     AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE,
-    AUDIO_ENGINE_EVENT_PLAYBACK_STARTED,
-    AUDIO_ENGINE_EVENT_PLAYBACK_LOW,
-    AUDIO_ENGINE_EVENT_PLAYBACK_DRAINED,
-    AUDIO_ENGINE_EVENT_I2S_DRAINED,
     AUDIO_ENGINE_EVENT_INTERRUPT,
     AUDIO_ENGINE_EVENT_GENERATION_CHANGED,
     AUDIO_ENGINE_EVENT_ERROR
@@ -49,7 +45,9 @@ typedef struct {
     size_t pending_bytes;
 } audio_engine_turn_t;
 
-/* One brain: WebSocket only hands model audio to AudioEngine. */
+typedef void (*audio_engine_mic_frame_cb_t)(const uint8_t *pcm, size_t len, void *ctx);
+
+/* One brain: AudioEngine owns the complete audio flow. */
 bool audio_engine_init(void);
 audio_engine_state_t audio_engine_get_state(void);
 const char *audio_engine_state_name(audio_engine_state_t state);
@@ -57,11 +55,18 @@ bool audio_engine_turn_active(void);
 const audio_engine_turn_t *audio_engine_get_turn(void);
 void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation);
 
-/* Gemini -> AudioEngine. Buffer, playback decisions and accounting live here. */
+/* Gemini -> AudioEngine. */
 bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t generation);
 bool audio_engine_push_model_audio_base64(const char *b64, size_t len, uint32_t generation);
 
-/* Session/turn controls owned by AudioEngine. */
+/* MIC -> AudioEngine -> listener/transport. */
+bool audio_engine_set_mic_listener(audio_engine_mic_frame_cb_t cb, void *ctx);
+bool audio_engine_start_capture(void);
+void audio_engine_start_input_session(void);
+void audio_engine_stop_input_session(void);
+bool audio_engine_input_session_active(void);
+
+/* Session/turn controls. */
 void audio_engine_clear_buffer(void);
 void audio_engine_reset_turn_stats(void);
 void audio_engine_begin_turn(uint32_t generation);
