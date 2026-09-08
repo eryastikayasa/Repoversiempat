@@ -42,6 +42,8 @@ uint64_t audio_bytes_playback_dropped = 0;
 
 static volatile uint32_t audio_turn_generation = 0;
 static int64_t audio_drain_deadline_us = 0;
+static uint64_t audio_received_accounted = 0;
+static uint32_t audio_chunks_accounted = 0;
 
 
 /* -------------------------------------------------------------------------- */
@@ -780,6 +782,9 @@ void reset_audio_turn_stats(void)
     audio_bytes_dropped = 0;
     audio_bytes_playback_dropped = 0;
 
+    audio_received_accounted = 0;
+    audio_chunks_accounted = 0;
+
     audio_turn_active = false;
     audio_turn_complete_pending = false;
 
@@ -808,6 +813,9 @@ void begin_audio_turn(void)
 
     audio_bytes_dropped = 0;
     audio_bytes_playback_dropped = 0;
+
+    audio_received_accounted = 0;
+    audio_chunks_accounted = 0;
 
     audio_drain_deadline_us = 0;
 
@@ -914,6 +922,12 @@ bool queue_audio_pcm(
 
 
     begin_audio_turn();
+    audio_received_accounted += len;
+    audio_chunks_accounted++;
+
+    audio_bytes_received = audio_received_accounted;
+    audio_chunks_received = audio_chunks_accounted;
+    
 
 
     uint64_t queued_before =
