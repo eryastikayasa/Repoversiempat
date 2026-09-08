@@ -59,6 +59,8 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation);
 
 /* Gemini -> AudioEngine. Buffer, playback decisions and accounting live here. */
 bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t generation);
+/* Gemini JSON parser may hand Base64 directly to AudioEngine; decoding is not a WebSocket transport concern. */
+bool audio_engine_push_model_audio_base64(const char *b64, size_t len, uint32_t generation);
 
 /* Session/turn controls owned by AudioEngine. */
 void audio_engine_clear_buffer(void);
