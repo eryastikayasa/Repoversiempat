@@ -8,9 +8,8 @@
 
 static const char *TAG = "AUDIO_INGEST";
 
-/* Decode in small bounded blocks so a large Gemini JSON message never needs
- * a large temporary PCM workspace. AudioEngine remains the sole owner of the
- * PCM ring, playback policy, and audio accounting. */
+/* Decode in bounded blocks. A one-byte carry keeps PCM16 aligned because a
+ * four-character Base64 quantum normally produces three bytes. */
 static constexpr size_t DECODE_INPUT_QUAD_CHARS = 4;
 static constexpr size_t DECODE_OUTPUT_BLOCK = 768;
 
@@ -20,7 +19,9 @@ extern "C" bool audio_engine_push_model_audio_base64(const char *b64, size_t len
 
     size_t quad_len = 0;
     unsigned char quad[DECODE_INPUT_QUAD_CHARS];
-    uint8_t pcm[DECODE_OUTPUT_BLOCK];
+    uint8_t pcm[DECODE_OUTPUT_BLOCK + 1];
+    uint8_t carry = 0;
+    bool have_carry = false;
     bool pushed_any = false;
 
     for (size_t i = 0; i < len; ++i) {
@@ -32,7 +33,8 @@ extern "C" bool audio_engine_push_model_audio_base64(const char *b64, size_t len
 
         size_t decoded = 0;
         const int ret = mbedtls_base64_decode(
-            pcm, sizeof(pcm), &decoded, quad, DECODE_INPUT_QUAD_CHARS);
+            pcm + (have_carry ? 1 : 0), sizeof(pcm) - (have_carry ? 1 : 0),
+            &decoded, quad, DECODE_INPUT_QUAD_CHARS);
         quad_len = 0;
 
         if (ret != 0 || decoded == 0) {
@@ -40,16 +42,36 @@ extern "C" bool audio_engine_push_model_audio_base64(const char *b64, size_t len
             return false;
         }
 
-        if (!audio_engine_push_model_audio(pcm, decoded, generation)) {
-            ESP_LOGW(TAG, "AudioEngine menolak PCM Base64 chunk: bytes=%u",
-                     (unsigned)decoded);
-            return pushed_any;
+        size_t total = decoded;
+        if (have_carry) {
+            pcm[0] = carry;
+            ++total;
+            have_carry = false;
         }
-        pushed_any = true;
+
+        if (total & 1U) {
+            carry = pcm[total - 1];
+            have_carry = true;
+            --total;
+        }
+
+        if (total > 0) {
+            if (!audio_engine_push_model_audio(pcm, total, generation)) {
+                ESP_LOGW(TAG, "AudioEngine menolak PCM Base64 chunk: bytes=%u",
+                         (unsigned)total);
+                return pushed_any;
+            }
+            pushed_any = true;
+        }
     }
 
     if (quad_len != 0) {
         ESP_LOGW(TAG, "Base64 audio tidak lengkap: sisa=%u karakter", (unsigned)quad_len);
+        return false;
+    }
+
+    if (have_carry) {
+        ESP_LOGW(TAG, "Base64 audio menghasilkan byte PCM ganjil; frame tidak lengkap");
         return false;
     }
 
