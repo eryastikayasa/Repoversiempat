@@ -103,6 +103,16 @@ bool audio_engine_init(void)
 
 audio_engine_state_t audio_engine_get_state(void) { return s_state; }
 const char *audio_engine_state_name(audio_engine_state_t state) { return state_name(state); }
+
+bool audio_engine_turn_active(void)
+{
+    const audio_engine_state_t state = s_state;
+    return state == AUDIO_ENGINE_BUFFERING ||
+           state == AUDIO_ENGINE_PLAYING ||
+           state == AUDIO_ENGINE_PLAYING_LOW ||
+           state == AUDIO_ENGINE_DRAINING;
+}
+
 const audio_engine_turn_t *audio_engine_get_turn(void) { return &s_turn; }
 
 void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
