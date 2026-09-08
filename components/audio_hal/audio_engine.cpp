@@ -2,34 +2,44 @@
 #include "audio_hal.h"
 #include "display.h"
 #include "esp_log.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/stream_buffer.h"
+#include "freertos/semphr.h"
 
-/* Transitional bridge: AudioEngine still reads transport-owned generation and
- * playback telemetry. Turn lifecycle state itself is owned here. */
-extern volatile uint32_t websocket_connection_generation;
-extern uint64_t audio_bytes_received;
-extern uint64_t audio_bytes_queued;
-extern uint64_t audio_bytes_played;
-extern uint64_t audio_bytes_dropped;
-extern uint64_t audio_bytes_playback_dropped;
-extern size_t get_audio_pending_bytes(void);
-extern void request_audio_buffer_clear(void);
+#include <string.h>
 
 static const char *TAG = "AUDIO_ENGINE";
 
 /* Gemini Live output: PCM16 mono at 24 kHz. */
 static constexpr uint32_t ENGINE_OUTPUT_SAMPLE_RATE = 24000U;
 static constexpr uint32_t ENGINE_OUTPUT_BYTES_PER_SEC = ENGINE_OUTPUT_SAMPLE_RATE * 2U;
+static constexpr size_t ENGINE_RING_BUFFER_SIZE = 512U * 1024U;
 static constexpr size_t ENGINE_PREBUFFER_BYTES = 128U * 1024U;
 static constexpr size_t ENGINE_WARNING_BYTES = 64U * 1024U;
 static constexpr size_t ENGINE_CRITICAL_BYTES = 32U * 1024U;
+static constexpr size_t ENGINE_PLAYBACK_READ_SIZE = 1024U;
+static constexpr size_t ENGINE_SEND_CHUNK_SIZE = 1024U;
+static constexpr TickType_t ENGINE_BUFFER_SEND_WAIT = pdMS_TO_TICKS(20);
+static constexpr uint32_t ENGINE_I2S_DRAIN_MS = 20U;
 
 static volatile bool s_initialized = false;
+static volatile bool s_clear_pending = false;
 static volatile audio_engine_state_t s_state = AUDIO_ENGINE_IDLE;
 static audio_engine_turn_t s_turn = {};
-static uint32_t s_last_generation = 0;
 static TaskHandle_t s_task = nullptr;
+static StreamBufferHandle_t s_stream = nullptr;
+static SemaphoreHandle_t s_stream_mutex = nullptr;
+static StaticSemaphore_t s_stream_mutex_storage;
+static int64_t s_drain_deadline_us = 0;
+static int64_t s_last_queue_us = 0;
+static int64_t s_low_since_us = 0;
+static size_t s_last_queue_len = 0;
+static uint8_t s_buffer_level = 0;
+static uint8_t *s_buffer_mem = nullptr;
+static StaticStreamBuffer_t s_stream_storage;
 
 static const char *state_name(audio_engine_state_t state)
 {
@@ -61,43 +71,308 @@ static void reset_turn(uint32_t generation)
     s_turn.generation = generation;
 }
 
-static void sync_task(void *arg)
+static size_t pending_bytes_locked(void)
+{
+    return s_stream ? xStreamBufferBytesAvailable(s_stream) : 0;
+}
+
+static size_t pending_bytes(void)
+{
+    if (!s_stream) return 0;
+    if (s_stream_mutex && xSemaphoreTake(s_stream_mutex, pdMS_TO_TICKS(10)) != pdTRUE)
+        return xStreamBufferBytesAvailable(s_stream);
+    const size_t pending = pending_bytes_locked();
+    if (s_stream_mutex) xSemaphoreGive(s_stream_mutex);
+    return pending;
+}
+
+static void reset_playback_timeline(void)
+{
+    s_drain_deadline_us = 0;
+    s_last_queue_us = 0;
+    s_low_since_us = 0;
+    s_last_queue_len = 0;
+    s_buffer_level = 0;
+}
+
+static void reset_buffer_locked(void)
+{
+    if (s_stream) xStreamBufferReset(s_stream);
+}
+
+static void clear_buffer_internal(void)
+{
+    if (s_stream_mutex) xSemaphoreTake(s_stream_mutex, portMAX_DELAY);
+    reset_buffer_locked();
+    if (s_stream_mutex) xSemaphoreGive(s_stream_mutex);
+    reset_playback_timeline();
+}
+
+static void update_buffer_level(size_t pending, bool turn_active)
+{
+    if (!turn_active) {
+        s_low_since_us = 0;
+        s_buffer_level = 0;
+        return;
+    }
+
+    if (pending < ENGINE_PREBUFFER_BYTES) {
+        if (s_low_since_us == 0) s_low_since_us = esp_timer_get_time();
+    } else {
+        s_low_since_us = 0;
+    }
+
+    uint8_t level = 0; /* EMPTY */
+    if (pending >= ENGINE_RING_BUFFER_SIZE) level = 5; /* FULL */
+    else if (pending >= ENGINE_PREBUFFER_BYTES) level = 4; /* HIGH/TARGET */
+    else if (pending >= ENGINE_WARNING_BYTES) level = 3; /* TARGET */
+    else if (pending >= ENGINE_CRITICAL_BYTES) level = 2; /* LOW */
+    else if (pending > 0) level = 1; /* CRITICAL */
+
+    if (level == s_buffer_level) return;
+    s_buffer_level = level;
+
+    if (level == 1) {
+        ESP_LOGW(TAG, "BUFFER CRITICAL: pending=%u B (~%u ms)",
+                 (unsigned)pending,
+                 (unsigned)((pending * 1000U) / ENGINE_OUTPUT_BYTES_PER_SEC));
+        if (s_state == AUDIO_ENGINE_PLAYING)
+            set_state(AUDIO_ENGINE_PLAYING_LOW);
+    } else if (level == 2) {
+        ESP_LOGW(TAG, "BUFFER LOW: pending=%u B (~%u ms)",
+                 (unsigned)pending,
+                 (unsigned)((pending * 1000U) / ENGINE_OUTPUT_BYTES_PER_SEC));
+    } else if (level >= 4) {
+        ESP_LOGI(TAG, "BUFFER TARGET/HIGH: pending=%u B (~%u ms)",
+                 (unsigned)pending,
+                 (unsigned)((pending * 1000U) / ENGINE_OUTPUT_BYTES_PER_SEC));
+    }
+}
+
+static bool ensure_buffer(void)
+{
+    if (s_stream) return true;
+
+    if (!s_stream_mutex) {
+        s_stream_mutex = xSemaphoreCreateMutexStatic(&s_stream_mutex_storage);
+        if (!s_stream_mutex) return false;
+    }
+
+    s_buffer_mem = (uint8_t *)heap_caps_malloc(ENGINE_RING_BUFFER_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!s_buffer_mem)
+        s_buffer_mem = (uint8_t *)heap_caps_malloc(ENGINE_RING_BUFFER_SIZE, MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    if (!s_buffer_mem) {
+        ESP_LOGE(TAG, "Gagal alokasi audio ring %u byte", (unsigned)ENGINE_RING_BUFFER_SIZE);
+        return false;
+    }
+
+    s_stream = xStreamBufferCreateStatic(
+        ENGINE_RING_BUFFER_SIZE,
+        ENGINE_SEND_CHUNK_SIZE,
+        s_buffer_mem,
+        &s_stream_storage);
+    if (!s_stream) {
+        heap_caps_free(s_buffer_mem);
+        s_buffer_mem = nullptr;
+        ESP_LOGE(TAG, "Gagal membuat AudioEngine stream buffer");
+        return false;
+    }
+    return true;
+}
+
+static void finish_playback_if_drained(size_t pending)
+{
+    if (!s_turn.model_complete || pending != 0) {
+        s_drain_deadline_us = 0;
+        return;
+    }
+
+    const int64_t now_us = esp_timer_get_time();
+    if (s_drain_deadline_us == 0) {
+        s_drain_deadline_us = now_us + ((int64_t)ENGINE_I2S_DRAIN_MS * 1000LL);
+        return;
+    }
+    if (now_us < s_drain_deadline_us) return;
+
+    s_drain_deadline_us = 0;
+    s_turn.playback_drained = true;
+    set_state(AUDIO_ENGINE_COMPLETE);
+
+    const int64_t network_balance =
+        (int64_t)s_turn.bytes_received -
+        (int64_t)(s_turn.bytes_queued + s_turn.network_drop);
+    const int64_t playback_balance =
+        (int64_t)s_turn.bytes_queued -
+        (int64_t)(s_turn.bytes_played + s_turn.playback_drop);
+
+    ESP_LOGI(TAG,
+             "AUDIO COMPLETE: rx=%llu queued=%llu played=%llu net_drop=%llu play_drop=%llu net_bal=%lld play_bal=%lld underrun=%lu",
+             (unsigned long long)s_turn.bytes_received,
+             (unsigned long long)s_turn.bytes_queued,
+             (unsigned long long)s_turn.bytes_played,
+             (unsigned long long)s_turn.network_drop,
+             (unsigned long long)s_turn.playback_drop,
+             (long long)network_balance,
+             (long long)playback_balance,
+             (unsigned long)s_turn.underrun_count);
+
+    face_set_state(FACE_LISTENING);
+    set_state(AUDIO_ENGINE_IDLE);
+}
+
+static void playback_task(void *arg)
 {
     (void)arg;
+    static uint8_t playback_buffer[ENGINE_PLAYBACK_READ_SIZE];
+    bool playback_started = false;
+    bool underrun_reported = false;
+    int64_t last_stats_us = 0;
+
     ESP_LOGI(TAG,
-             "AudioEngine: output=%uHz PCM16, prebuffer=%uB (~%ums), warning=%uB (~%ums), critical=%uB (~%ums)",
+             "AudioEngine playback: %uHz PCM16 mono, ring=%u, prebuffer=%u, warning=%u, critical=%u, read=%u, core=%d priority=5",
              (unsigned)ENGINE_OUTPUT_SAMPLE_RATE,
+             (unsigned)ENGINE_RING_BUFFER_SIZE,
              (unsigned)ENGINE_PREBUFFER_BYTES,
-             (unsigned)((ENGINE_PREBUFFER_BYTES * 1000U) / ENGINE_OUTPUT_BYTES_PER_SEC),
              (unsigned)ENGINE_WARNING_BYTES,
-             (unsigned)((ENGINE_WARNING_BYTES * 1000U) / ENGINE_OUTPUT_BYTES_PER_SEC),
              (unsigned)ENGINE_CRITICAL_BYTES,
-             (unsigned)((ENGINE_CRITICAL_BYTES * 1000U) / ENGINE_OUTPUT_BYTES_PER_SEC));
+             (unsigned)ENGINE_PLAYBACK_READ_SIZE,
+             xPortGetCoreID());
 
     for (;;) {
-        audio_engine_sync_legacy_state();
-        vTaskDelay(pdMS_TO_TICKS(20));
+        if (s_clear_pending) {
+            s_clear_pending = false;
+            clear_buffer_internal();
+            playback_started = false;
+            underrun_reported = false;
+        }
+
+        if (!s_stream) {
+            vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        const size_t pending = pending_bytes();
+        const bool active = audio_engine_turn_active();
+        update_buffer_level(pending, active);
+
+        if (!playback_started && pending < ENGINE_PREBUFFER_BYTES && active && !s_turn.model_complete) {
+            vTaskDelay(1);
+            continue;
+        }
+
+        if (playback_started && pending == 0 && active && !s_turn.model_complete) {
+            if (!underrun_reported) {
+                const int64_t now_us = esp_timer_get_time();
+                const int64_t input_gap_ms = s_last_queue_us > 0 ?
+                    (now_us - s_last_queue_us) / 1000LL : -1LL;
+                const int64_t low_for_ms = s_low_since_us > 0 ?
+                    (now_us - s_low_since_us) / 1000LL : 0LL;
+                ESP_LOGW(TAG,
+                         "AUDIO UNDERRUN: input_gap=%lldms low_for=%lldms last_queue=%u rx=%llu queued=%llu played=%llu net_drop=%llu play_drop=%llu",
+                         (long long)input_gap_ms,
+                         (long long)low_for_ms,
+                         (unsigned)s_last_queue_len,
+                         (unsigned long long)s_turn.bytes_received,
+                         (unsigned long long)s_turn.bytes_queued,
+                         (unsigned long long)s_turn.bytes_played,
+                         (unsigned long long)s_turn.network_drop,
+                         (unsigned long long)s_turn.playback_drop);
+                s_turn.underrun_count++;
+                underrun_reported = true;
+            }
+            playback_started = false;
+            s_buffer_level = 0;
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        size_t received = 0;
+        if (s_stream_mutex && xSemaphoreTake(s_stream_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            received = xStreamBufferReceive(s_stream, playback_buffer, sizeof(playback_buffer), 0);
+            xSemaphoreGive(s_stream_mutex);
+        } else if (!s_stream_mutex) {
+            received = xStreamBufferReceive(s_stream, playback_buffer, sizeof(playback_buffer), 0);
+        }
+
+        if (received == 0) {
+            finish_playback_if_drained(pending_bytes());
+            vTaskDelay(1);
+            continue;
+        }
+
+        received &= ~((size_t)1);
+        if (received == 0) continue;
+
+        if (!playback_started) {
+            playback_started = true;
+            underrun_reported = false;
+            s_turn.playback_started = true;
+            if (s_state == AUDIO_ENGINE_BUFFERING || s_state == AUDIO_ENGINE_PLAYING_LOW)
+                set_state(AUDIO_ENGINE_PLAYING);
+            face_set_state(FACE_SPEAKING);
+        }
+
+        const size_t played = audio_write_speaker(playback_buffer, received);
+        s_turn.bytes_played += played;
+
+        if (played < received) {
+            const size_t dropped = received - played;
+            s_turn.playback_drop += dropped;
+            ESP_LOGW(TAG, "AUDIO PLAYBACK LOSS: received=%u played=%u dropped=%u",
+                     (unsigned)received, (unsigned)played, (unsigned)dropped);
+        }
+
+        s_turn.pending_bytes = pending_bytes();
+        finish_playback_if_drained(s_turn.pending_bytes);
+
+        const int64_t now_us = esp_timer_get_time();
+        if (last_stats_us == 0 || now_us - last_stats_us >= 1000000LL) {
+            last_stats_us = now_us;
+            ESP_LOGI(TAG,
+                     "AUDIO FLOW: pending=%u/%u received=%llu queued=%llu played=%llu net_drop=%llu play_drop=%llu",
+                     (unsigned)s_turn.pending_bytes,
+                     (unsigned)ENGINE_RING_BUFFER_SIZE,
+                     (unsigned long long)s_turn.bytes_received,
+                     (unsigned long long)s_turn.bytes_queued,
+                     (unsigned long long)s_turn.bytes_played,
+                     (unsigned long long)s_turn.network_drop,
+                     (unsigned long long)s_turn.playback_drop);
+        }
+
+        if (!audio_engine_turn_active() && s_turn.pending_bytes == 0) {
+            playback_started = false;
+            underrun_reported = false;
+            reset_playback_timeline();
+        }
     }
 }
 
 bool audio_engine_init(void)
 {
     if (s_initialized) return true;
+    if (!ensure_buffer()) {
+        s_state = AUDIO_ENGINE_ERROR;
+        return false;
+    }
 
-    s_last_generation = websocket_connection_generation;
-    reset_turn(s_last_generation);
+    reset_turn(0);
+    reset_playback_timeline();
 
-    BaseType_t rc = xTaskCreate(
-        sync_task, "audio_engine", 3072, nullptr, 4, &s_task);
+    BaseType_t rc = xTaskCreatePinnedToCore(
+        playback_task, "audio_playback", 4096, nullptr, 5, &s_task, 0);
     if (rc != pdPASS) {
         s_state = AUDIO_ENGINE_ERROR;
         s_task = nullptr;
-        ESP_LOGE(TAG, "Gagal membuat AudioEngine control task");
+        ESP_LOGE(TAG, "Gagal membuat AudioEngine playback task");
         return false;
     }
 
     s_initialized = true;
-    ESP_LOGI(TAG, "AudioEngine aktif: 1 otak audio");
+    ESP_LOGI(TAG,
+             "AudioEngine aktif: 1 otak audio | output=%uHz PCM16 | ring=%uB | prebuffer=%uB",
+             (unsigned)ENGINE_OUTPUT_SAMPLE_RATE,
+             (unsigned)ENGINE_RING_BUFFER_SIZE,
+             (unsigned)ENGINE_PREBUFFER_BYTES);
     return true;
 }
 
@@ -119,19 +394,27 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
 {
     if (!s_initialized) return;
 
-    const uint32_t connection_generation = websocket_connection_generation;
-    if (generation == 0) generation = connection_generation;
-
-    if (generation != s_turn.generation) {
+    if (event == AUDIO_ENGINE_EVENT_GENERATION_CHANGED) {
+        clear_buffer_internal();
         reset_turn(generation);
-        s_last_generation = generation;
         set_state(AUDIO_ENGINE_IDLE);
+        return;
+    }
+
+    if (generation != 0 && s_turn.generation != 0 && generation != s_turn.generation) {
+        clear_buffer_internal();
+        reset_turn(generation);
+        set_state(AUDIO_ENGINE_IDLE);
+    } else if (s_turn.generation == 0 && generation != 0) {
+        s_turn.generation = generation;
     }
 
     switch (event) {
         case AUDIO_ENGINE_EVENT_MODEL_BEGIN:
-            if (s_turn.model_complete || s_state == AUDIO_ENGINE_COMPLETE || s_state == AUDIO_ENGINE_INTERRUPTED)
-                reset_turn(generation);
+            if (s_state == AUDIO_ENGINE_COMPLETE || s_state == AUDIO_ENGINE_INTERRUPTED ||
+                (s_state == AUDIO_ENGINE_IDLE && s_turn.model_complete)) {
+                audio_engine_begin_turn(generation);
+            }
             s_turn.model_started = true;
             s_turn.model_complete = false;
             s_turn.playback_started = false;
@@ -141,6 +424,7 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
 
         case AUDIO_ENGINE_EVENT_MODEL_AUDIO:
             s_turn.model_started = true;
+            s_turn.model_complete = false;
             if (s_state == AUDIO_ENGINE_IDLE || s_state == AUDIO_ENGINE_LISTENING || s_state == AUDIO_ENGINE_THINKING)
                 set_state(AUDIO_ENGINE_BUFFERING);
             break;
@@ -166,24 +450,12 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
 
         case AUDIO_ENGINE_EVENT_I2S_DRAINED:
             s_turn.playback_drained = true;
-            if (s_turn.model_complete) {
-                set_state(AUDIO_ENGINE_COMPLETE);
-                face_set_state(FACE_LISTENING);
-                set_state(AUDIO_ENGINE_IDLE);
-            }
             break;
 
         case AUDIO_ENGINE_EVENT_INTERRUPT:
-            request_audio_buffer_clear();
+            clear_buffer_internal();
             set_state(AUDIO_ENGINE_INTERRUPTED);
             reset_turn(generation);
-            break;
-
-        case AUDIO_ENGINE_EVENT_GENERATION_CHANGED:
-            reset_turn(generation);
-            s_last_generation = generation;
-            request_audio_buffer_clear();
-            set_state(AUDIO_ENGINE_IDLE);
             break;
 
         case AUDIO_ENGINE_EVENT_ERROR:
@@ -195,18 +467,113 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation)
     }
 }
 
-void audio_engine_note_audio(size_t bytes)
+void audio_engine_begin_turn(uint32_t generation)
 {
-    (void)bytes;
     if (!s_initialized) return;
-    s_turn.pending_bytes = get_audio_pending_bytes();
+    if (generation == 0) generation = s_turn.generation;
+
+    clear_buffer_internal();
+    reset_turn(generation);
+    set_state(AUDIO_ENGINE_BUFFERING);
+}
+
+bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t generation)
+{
+    if (!s_initialized || !pcm || len == 0) return false;
+    len &= ~((size_t)1);
+    if (len == 0) return false;
+
+    if (s_turn.generation == 0 || s_state == AUDIO_ENGINE_IDLE || s_turn.model_complete) {
+        audio_engine_begin_turn(generation);
+    } else if (generation != 0 && s_turn.generation != generation) {
+        audio_engine_begin_turn(generation);
+    }
+
+    s_turn.model_started = true;
+    s_turn.model_complete = false;
+    if (s_state == AUDIO_ENGINE_IDLE || s_state == AUDIO_ENGINE_LISTENING || s_state == AUDIO_ENGINE_THINKING)
+        set_state(AUDIO_ENGINE_BUFFERING);
+
+    const int64_t now_us = esp_timer_get_time();
+    if (s_last_queue_us != 0) {
+        const int64_t gap_us = now_us - s_last_queue_us;
+        if (gap_us >= 100000LL) {
+            ESP_LOGW(TAG, "AUDIO INPUT GAP: gap=%lldms len=%u pending=%u",
+                     (long long)(gap_us / 1000LL),
+                     (unsigned)len,
+                     (unsigned)pending_bytes());
+        }
+    }
+    s_last_queue_us = now_us;
+    s_last_queue_len = len;
+
+    s_turn.bytes_received += len;
+
+    size_t offset = 0;
+    while (offset < len) {
+        size_t chunk = len - offset;
+        if (chunk > ENGINE_SEND_CHUNK_SIZE) chunk = ENGINE_SEND_CHUNK_SIZE;
+        if (chunk & 1U) chunk--;
+        if (chunk == 0) break;
+
+        size_t written = 0;
+        if (s_stream_mutex && xSemaphoreTake(s_stream_mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+            written = xStreamBufferSend(s_stream, pcm + offset, chunk, ENGINE_BUFFER_SEND_WAIT);
+            xSemaphoreGive(s_stream_mutex);
+        }
+        if (written > 0) {
+            s_turn.bytes_queued += written;
+            offset += written;
+        } else {
+            break;
+        }
+    }
+
+    if (offset < len) {
+        const size_t dropped = len - offset;
+        s_turn.network_drop += dropped;
+        ESP_LOGW(TAG, "AUDIO BUFFER DROP: received=%u queued=%u dropped=%u pending=%u",
+                 (unsigned)len,
+                 (unsigned)offset,
+                 (unsigned)dropped,
+                 (unsigned)pending_bytes());
+    }
+
+    s_turn.pending_bytes = pending_bytes();
+    return offset == len;
+}
+
+void audio_engine_clear_buffer(void)
+{
+    if (!s_initialized) return;
+    clear_buffer_internal();
+    s_turn.pending_bytes = 0;
+}
+
+void audio_engine_request_clear(void)
+{
+    s_clear_pending = true;
+}
+
+void audio_engine_reset_turn_stats(void)
+{
+    if (!s_initialized) return;
+    const uint32_t generation = s_turn.generation;
+    reset_turn(generation);
+    reset_playback_timeline();
+    clear_buffer_internal();
+}
+
+size_t audio_engine_get_pending_bytes(void)
+{
+    return pending_bytes();
 }
 
 void audio_engine_note_playback(size_t bytes)
 {
     (void)bytes;
     if (!s_initialized) return;
-    s_turn.pending_bytes = get_audio_pending_bytes();
+    s_turn.pending_bytes = pending_bytes();
 }
 
 void audio_engine_note_underrun(void)
@@ -215,25 +582,12 @@ void audio_engine_note_underrun(void)
     s_turn.underrun_count++;
 }
 
-void audio_engine_sync_legacy_state(void)
-{
-    if (!s_initialized) return;
-
-    const uint32_t generation = websocket_connection_generation;
-    if (generation != s_last_generation) {
-        audio_engine_notify(AUDIO_ENGINE_EVENT_GENERATION_CHANGED, generation);
-        return;
-    }
-
-    s_turn.generation = generation;
-    s_turn.pending_bytes = get_audio_pending_bytes();
-    s_turn.bytes_received = audio_bytes_received;
-    s_turn.bytes_queued = audio_bytes_queued;
-    s_turn.bytes_played = audio_bytes_played;
-    s_turn.network_drop = audio_bytes_dropped;
-    s_turn.playback_drop = audio_bytes_playback_dropped;
-
-    /* Compatibility telemetry only. Playback completion is event-driven. */
-    if (s_turn.model_complete && s_turn.pending_bytes > 0)
-        set_state(AUDIO_ENGINE_DRAINING);
-}
+/* Compatibility aliases: ownership remains entirely inside AudioEngine. */
+bool start_audio_playback(void) { return audio_engine_init(); }
+void clear_audio_buffer(void) { audio_engine_clear_buffer(); }
+void request_audio_buffer_clear(void) { audio_engine_request_clear(); }
+void reset_audio_turn_stats(void) { audio_engine_reset_turn_stats(); }
+void begin_audio_turn(void) { audio_engine_begin_turn(s_turn.generation); }
+size_t get_audio_pending_bytes(void) { return audio_engine_get_pending_bytes(); }
+bool queue_audio_pcm(const uint8_t *pcm, size_t len) { return audio_engine_push_model_audio(pcm, len, s_turn.generation); }
+void check_audio_playback_complete(void) { finish_playback_if_drained(pending_bytes()); }
