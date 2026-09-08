@@ -81,12 +81,13 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_connection_generation = websocket_connection_generation + 1;
             ESP_LOGI(TAG, "Connection generation=%lu",
                      (unsigned long)websocket_connection_generation);
+            /* Transport lifecycle only informs AudioEngine of the new generation.
+             * AudioEngine owns the resulting audio reset/turn state transition. */
             audio_engine_notify(AUDIO_ENGINE_EVENT_GENERATION_CHANGED,
                                 websocket_connection_generation);
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
-            audio_engine_request_clear();
             (void)websocket_rx_ingest_init();
             display_status("AI Terhubung...");
             websocket_schedule_setup(websocket_connection_generation);
@@ -151,7 +152,6 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
-            audio_engine_request_clear();
             websocket_cleanup_pending = true;
             break;
 
@@ -165,7 +165,6 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
-            audio_engine_request_clear();
             display_status("AI Disconnected");
             if (session_resumable && session_handle[0] != '\0')
                 ESP_LOGI(TAG, "Session resumption handle dipertahankan");
@@ -182,7 +181,6 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
-            audio_engine_request_clear();
             websocket_cleanup_pending = true;
             break;
 
