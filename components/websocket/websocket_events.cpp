@@ -122,7 +122,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
 
                 /* Keep normal traffic quiet. Only report timing large enough
                  * to plausibly explain an audio starvation event. */
-                if (event_gap_ms >= 30LL || callback_ms >= 30LL) {
+                if (event_gap_ms >= 1000LL || callback_ms >= 1000LL) {
                     ESP_LOGW(
                         TAG,
                         "AUDIO WS TIMELINE: "
