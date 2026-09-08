@@ -71,7 +71,6 @@ static int reserve_slot(void)
     return -1;
 }
 
-/* Alokasi slot hanya dipakai saat prealokasi, tidak saat streaming */
 static bool allocate_persistent_slot(int slot, size_t target)
 {
     if (slot < 0 || slot >= WS_RX_SLOT_COUNT || target == 0) return false;
@@ -99,7 +98,6 @@ static bool preallocate_rx_slots(void)
 {
     if (rx_slots_preallocated) return true;
 
-    // Semua slot 8 KB — cukup untuk compact JSON dan payload kecil
     for (int i = 0; i < WS_RX_SLOT_COUNT; ++i) {
         if (!allocate_persistent_slot(i, 8 * 1024)) {
             ESP_LOGE(TAG, "Prealokasi slot gagal: slot=%d", i);
@@ -133,10 +131,16 @@ static void free_rx_command(ws_rx_command_t *cmd)
     cmd->buffer = NULL;
 }
 
+// Fungsi log stats diubah agar hanya log untuk pesan besar atau setiap 10 pesan
 static void log_rx_stats(const char *reason, uint32_t message_len, uint32_t process_ms,
                          size_t heap_before, size_t heap_after,
                          size_t largest_before, size_t largest_after)
 {
+    // Hanya log jika pesan besar (>8KB) atau setiap 10 pesan
+    if (message_len <= 8192 && (rx_complete_messages % 10) != 0) {
+        return;
+    }
+
     ESP_LOGI(TAG,
              "RX STATS [%s]: fragments=%lu dropped_frag=%lu messages=%lu queue_hwm=%u seq_err=%lu buffer_drop=%lu queue_drop=%lu invalid=%lu oversize=%lu max_payload=%lu",
              reason, (unsigned long)rx_fragments_received,
@@ -145,10 +149,14 @@ static void log_rx_stats(const char *reason, uint32_t message_len, uint32_t proc
              (unsigned long)rx_buffer_drops, (unsigned long)rx_queue_drops,
              (unsigned long)rx_invalid_json, (unsigned long)rx_oversize_drops,
              (unsigned long)rx_largest_payload);
-    ESP_LOGI(TAG, "RX PROCESS: len=%lu time=%lu ms heap=%u->%u largest=%u->%u",
-             (unsigned long)message_len, (unsigned long)process_ms,
-             (unsigned)heap_before, (unsigned)heap_after,
-             (unsigned)largest_before, (unsigned)largest_after);
+
+    // RX PROCESS log hanya untuk pesan besar atau setiap 10 pesan juga
+    if (message_len > 8192 || (rx_complete_messages % 10) == 0) {
+        ESP_LOGI(TAG, "RX PROCESS: len=%lu time=%lu ms heap=%u->%u largest=%u->%u",
+                 (unsigned long)message_len, (unsigned long)process_ms,
+                 (unsigned)heap_before, (unsigned)heap_after,
+                 (unsigned)largest_before, (unsigned)largest_after);
+    }
 }
 
 static bool stream_append_char(char c)
@@ -398,6 +406,7 @@ static void websocket_rx_task(void *arg)
         size_t heap_after = esp_get_free_heap_size();
         size_t largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
         ++rx_complete_messages;
+        // Panggil log_rx_stats dengan aturan baru (hanya pesan besar atau setiap 10)
         log_rx_stats("processed", cmd.len, process_ms, heap_before, heap_after,
                      largest_before, largest_after);
         free_rx_command(&cmd);
@@ -418,7 +427,8 @@ bool websocket_rx_init(void)
     }
 
     if (!websocket_rx_task_handle) {
-        if (xTaskCreate(websocket_rx_task, "ws_rx", 8192, NULL, 5,
+        // Prioritas diturunkan ke 4 agar tidak terlalu bersaing dengan playback task
+        if (xTaskCreate(websocket_rx_task, "ws_rx", 8192, NULL, 4,
                         &websocket_rx_task_handle) != pdPASS) {
             ESP_LOGE(TAG, "Gagal membuat RX worker"); return false;
         }
@@ -493,8 +503,6 @@ bool websocket_rx_enqueue_data(esp_websocket_event_data_t *data, uint32_t genera
             ESP_LOGW(TAG, "RX BUFFER DROP: no free slot payload=%u", (unsigned)payload_len);
             return false;
         }
-
-        
 
         size_t required = ws_rx_streaming ? (WS_RX_STREAM_COMPACT_SIZE - 1) : payload_len;
         if (!ensure_slot_buffer(slot, required)) {
