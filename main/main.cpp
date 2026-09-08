@@ -42,7 +42,7 @@ static int wake_chunk_samples = 0;
 
 static volatile bool assistant_active = false;
 static volatile bool wake_requested = false;
-static volatile int reconnect_attempts = 0;
+static int reconnect_attempts = 0;
 static int64_t connect_start_us = 0;
 
 static bool wakeword_init(void)
