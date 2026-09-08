@@ -88,7 +88,6 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             websocket_tx_flush_queue();
             websocket_rx_flush_queue();
             websocket_rx_request_reset();
-            (void)websocket_rx_ingest_init();
             display_status("AI Terhubung...");
             websocket_schedule_setup(websocket_connection_generation);
             break;
@@ -109,8 +108,9 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
                         ? (event_start_us - ws_audio_last_event_us) / 1000LL
                         : -1LL;
 
-                /* WebSocket callback only hands transport fragments to RX worker. */
-                (void)websocket_rx_ingest_enqueue(
+                /* RX transport assembler only: copy the WebSocket fragment and return.
+                 * JSON parsing and all Base64/audio work stay outside this callback. */
+                (void)websocket_rx_enqueue_data(
                     data,
                     websocket_connection_generation);
 
