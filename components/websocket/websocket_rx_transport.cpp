@@ -70,8 +70,10 @@ static bool preallocate_rx_slots(void)
 {
     if (rx_slots_preallocated) return true;
 
+    /* Keep the persistent pool at the original 8KB/slot footprint. Larger
+     * complete messages grow only the slot that is actually needed. */
     for (int i = 0; i < WS_RX_SLOT_COUNT; ++i) {
-        if (!allocate_slot(i, WS_RX_SLOT_SIZE + WS_RX_TERMINATOR_SIZE)) {
+        if (!allocate_slot(i, 8 * 1024)) {
             ESP_LOGE(TAG, "Prealokasi RX slot gagal: slot=%d", i);
             return false;
         }
@@ -79,8 +81,7 @@ static bool preallocate_rx_slots(void)
     }
 
     rx_slots_preallocated = true;
-    ESP_LOGI(TAG, "RX transport slot pool siap: %dx%uB",
-             (unsigned)WS_RX_SLOT_COUNT, (unsigned)WS_RX_SLOT_SIZE);
+    ESP_LOGI(TAG, "RX transport slot pool siap: %dx8KB", (unsigned)WS_RX_SLOT_COUNT);
     return true;
 }
 
@@ -92,18 +93,14 @@ static bool ensure_slot_buffer(int slot, size_t required_payload)
     const size_t needed = required_payload + WS_RX_TERMINATOR_SIZE;
     if (rx_slots[slot] && rx_slot_capacity[slot] >= needed) return true;
 
-    size_t target = rx_slot_capacity[slot] ? rx_slot_capacity[slot] : WS_RX_SLOT_SIZE;
-    while (target < needed) {
-        if (target >= WS_RX_MAX_PAYLOAD_SIZE + WS_RX_TERMINATOR_SIZE) {
-            target = needed;
-            break;
-        }
-        target *= 2;
-    }
+    size_t target = rx_slot_capacity[slot] ? rx_slot_capacity[slot] : (8 * 1024);
+    while (target < needed) target *= 2;
     if (target > WS_RX_MAX_PAYLOAD_SIZE + WS_RX_TERMINATOR_SIZE)
         target = WS_RX_MAX_PAYLOAD_SIZE + WS_RX_TERMINATOR_SIZE;
 
-    return allocate_slot(slot, target);
+    if (!allocate_slot(slot, target)) return false;
+    ESP_LOGI(TAG, "RX slot grow: slot=%d capacity=%u", slot, (unsigned)target);
+    return true;
 }
 
 static void free_command(ws_rx_command_t *cmd)
@@ -186,8 +183,6 @@ static void websocket_rx_task(void *arg)
         const size_t largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
         const int64_t start_us = esp_timer_get_time();
 
-        /* Protocol parsing belongs to websocket_json.cpp. Transport only
-         * delivers a complete raw JSON message. */
         process_gemini_message((const char *)cmd.buffer, (size_t)cmd.len);
 
         const uint32_t process_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
