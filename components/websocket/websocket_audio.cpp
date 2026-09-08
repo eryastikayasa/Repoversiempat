@@ -24,12 +24,13 @@ uint64_t audio_bytes_playback_dropped = 0;
 /* -------------------------------------------------------------------------- */
 /* Konfigurasi Audio Playback                                                 */
 /* -------------------------------------------------------------------------- */
-#define AUDIO_OUTPUT_SAMPLE_RATE       24000U
-#define AUDIO_OUTPUT_BYTES_PER_SEC     (AUDIO_OUTPUT_SAMPLE_RATE * 2U)
-#define AUDIO_RING_BUFFER_SIZE          (256U * 1024U)   // 262144 byte ≈ 5,46 detik
-#define AUDIO_PLAYBACK_PREBUFFER_SIZE   (64U * 1024U)    // 65536 byte ≈ 1,36 detik
-#define AUDIO_PLAYBACK_WARNING_SIZE     (32U * 1024U)    // 32768 byte ≈ 682 ms
-#define AUDIO_PLAYBACK_CRITICAL_SIZE    (16U * 1024U)    // 16384 byte ≈ 341 ms
+#define AUDIO_OUTPUT_SAMPLE_RATE       16000U
+#define AUDIO_OUTPUT_BYTES_PER_SEC     (AUDIO_OUTPUT_SAMPLE_RATE * 2U) // 32000
+
+#define AUDIO_RING_BUFFER_SIZE          (512U * 1024U)   // 524288 byte
+#define AUDIO_PLAYBACK_PREBUFFER_SIZE   (128U * 1024U)   // 131072 byte (≈4 detik)
+#define AUDIO_PLAYBACK_WARNING_SIZE     (64U * 1024U)    // 65536 byte (≈2 detik)
+#define AUDIO_PLAYBACK_CRITICAL_SIZE    (32U * 1024U)    // 32768 byte (≈1 detik)
 
 /* Ukuran pembacaan dari ring buffer ke I2S */
 #define AUDIO_PLAYBACK_READ_SIZE       1024U
