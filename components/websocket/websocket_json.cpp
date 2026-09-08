@@ -173,6 +173,17 @@ bool build_gemini_setup(char **output, size_t *output_len)
     cJSON_AddStringToObject(prebuilt, "voiceName", "Kore");
     cJSON_AddStringToObject(setup, "model", "models/gemini-3.1-flash-live-preview");
     cJSON_AddObjectToObject(setup, "inputAudioTranscription");
+    // Format input audio (PCM 16 kHz mono)
+cJSON *input_audio_format = cJSON_AddObjectToObject(setup, "inputAudioFormat");
+cJSON_AddStringToObject(input_audio_format, "encoding", "PCM");
+cJSON_AddNumberToObject(input_audio_format, "sampleRate", 16000);
+cJSON_AddNumberToObject(input_audio_format, "channels", 1);
+
+// Format output audio (PCM 16 kHz mono) - mengurangi bandwidth
+cJSON *output_audio_format = cJSON_AddObjectToObject(setup, "outputAudioFormat");
+cJSON_AddStringToObject(output_audio_format, "encoding", "PCM");
+cJSON_AddNumberToObject(output_audio_format, "sampleRate", 16000);
+cJSON_AddNumberToObject(output_audio_format, "channels", 1);
 
     cJSON *system_instruction = cJSON_AddObjectToObject(setup, "systemInstruction");
     cJSON *system_parts = cJSON_AddArrayToObject(system_instruction, "parts");
