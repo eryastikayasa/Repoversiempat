@@ -158,12 +158,9 @@ void websocket_app_start(void)
     if (!wifi_is_ready() || client || ws_started) return;
     if (!audio_engine_init()) { ESP_LOGE(TAG, "AudioEngine gagal init - WebSocket audio dibatalkan"); return; }
     log_ws_heap("after_audio_engine_init");
-    audio_engine_clear_buffer();
-    audio_engine_reset_turn_stats();
     reset_rx_buffer();
     websocket_tx_flush_queue();
     if (!websocket_tx_init() || !websocket_rx_init()) return;
-    log_ws_heap("after_ws_tx_rx_init");
     is_connected = false; setup_complete = false; websocket_tx_error = false; ws_started = false;
     esp_websocket_client_config_t cfg = {};
     cfg.uri = WEBSOCKET_SERVER_URL;
