@@ -39,14 +39,6 @@ static volatile bool ws_started = false;
 QueueHandle_t websocket_tx_queue = NULL;
 TaskHandle_t websocket_tx_task_handle = NULL;
 
-/* Cleanup worker state */
-static TaskHandle_t websocket_cleanup_task_handle = NULL;
-static volatile bool websocket_cleanup_pending = false;
-
-/* AudioEngine is the audio control-plane owner. The legacy playback path is
- * still retained below, but lifecycle notifications are routed through the
- * engine so WebSocket JSON does not need to know playback policy. */
-
 static void log_ws_heap(const char *where)
 {
     ESP_LOGI(TAG, "HEAP[%s]: free=%u largest=%u", where,
@@ -54,19 +46,24 @@ static void log_ws_heap(const char *where)
              (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
 }
 
-static void websocket_cleanup_task(void *arg)
+static void websocket_tx_fail(void)
 {
-    (void)arg;
-    for (;;) {
-        if (!websocket_cleanup_pending) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            continue;
-        }
-        websocket_cleanup_pending = false;
-        ESP_LOGI(TAG, "WebSocket cleanup worker: cleanup diproses");
-        websocket_cleanup_complete();
-        vTaskDelay(pdMS_TO_TICKS(10));
+    websocket_tx_error = true;
+    is_connected = false;
+    setup_complete = false;
+    ESP_LOGE(TAG, "WebSocket TX failure: audio/control TX dihentikan");
+}
+
+void websocket_tx_flush_queue(void)
+{
+    if (!websocket_tx_queue) return;
+    ws_tx_command_t stale = {};
+    unsigned flushed = 0;
+    while (xQueueReceive(websocket_tx_queue, &stale, 0) == pdTRUE) {
+        if (stale.data) free(stale.data);
+        ++flushed;
     }
+    if (flushed) ESP_LOGW(TAG, "TX queue dibersihkan: %u command", flushed);
 }
 
 static void websocket_tx_task(void *arg)
@@ -100,40 +97,25 @@ static void websocket_tx_task(void *arg)
             constexpr TickType_t AUDIO_SEND_RETRY_DELAY = pdMS_TO_TICKS(30);
             constexpr int AUDIO_SEND_RETRIES = 1;
             if (!audio_data || !cmd.len) { free(audio_data); continue; }
-
             size_t offset = 0;
             bool send_failed = false;
             while (offset < cmd.len) {
-                if (cmd.generation != websocket_connection_generation || !is_connected || websocket_tx_error || client != ws || !esp_websocket_client_is_connected(ws)) {
-                    send_failed = true;
-                    break;
-                }
+                if (cmd.generation != websocket_connection_generation || !is_connected || websocket_tx_error || client != ws || !esp_websocket_client_is_connected(ws)) { send_failed = true; break; }
                 size_t chunk_len = cmd.len - offset;
                 if (chunk_len > PCM_SEND_CHUNK) chunk_len = PCM_SEND_CHUNK;
                 size_t encoded_len = 0;
                 int ret = mbedtls_base64_encode((unsigned char *)b64_buf, sizeof(b64_buf) - 1, &encoded_len, audio_data + offset, chunk_len);
-                if (ret != 0) {
-                    ESP_LOGW(TAG, "TX audio base64 gagal: ret=%d chunk=%u", ret, (unsigned)chunk_len);
-                    send_failed = true;
-                    break;
-                }
+                if (ret != 0) { ESP_LOGW(TAG, "TX audio base64 gagal: ret=%d chunk=%u", ret, (unsigned)chunk_len); send_failed = true; break; }
                 b64_buf[encoded_len] = '\0';
                 int json_len = snprintf(json_buf, sizeof(json_buf), "{\"realtimeInput\":{\"mediaChunks\":[{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}]}}", b64_buf);
-                if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) {
-                    send_failed = true;
-                    break;
-                }
+                if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) { send_failed = true; break; }
                 bool sent_ok = false;
                 for (int retry = 0; retry <= AUDIO_SEND_RETRIES; ++retry) {
                     int sent = esp_websocket_client_send_text(ws, json_buf, json_len, AUDIO_SEND_TIMEOUT);
                     if (sent == json_len) { sent_ok = true; break; }
                     if (retry < AUDIO_SEND_RETRIES) vTaskDelay(AUDIO_SEND_RETRY_DELAY);
                 }
-                if (!sent_ok) {
-                    ESP_LOGW(TAG, "TX audio send gagal: offset=%u chunk=%u", (unsigned)offset, (unsigned)chunk_len);
-                    send_failed = true;
-                    break;
-                }
+                if (!sent_ok) { ESP_LOGW(TAG, "TX audio send gagal: offset=%u chunk=%u", (unsigned)offset, (unsigned)chunk_len); send_failed = true; break; }
                 offset += chunk_len;
             }
             if (send_failed) websocket_tx_fail();
@@ -152,9 +134,6 @@ bool websocket_tx_init(void)
     }
     if (!websocket_tx_task_handle) {
         if (xTaskCreate(websocket_tx_task, "ws_tx", 8192, NULL, 4, &websocket_tx_task_handle) != pdPASS) return false;
-    }
-    if (!websocket_cleanup_task_handle) {
-        if (xTaskCreate(websocket_cleanup_task, "ws_cleanup", 3072, NULL, 3, &websocket_cleanup_task_handle) != pdPASS) return false;
     }
     log_ws_heap("after_ws_tx_init");
     return true;
@@ -188,12 +167,7 @@ void websocket_app_start(void)
 {
     ESP_LOGI(TAG, "Memulai Gemini WebSocket V7.0.22");
     if (!wifi_is_ready() || client || ws_started) return;
-
-    if (!audio_engine_init()) {
-        ESP_LOGE(TAG, "AudioEngine gagal init - WebSocket audio dibatalkan");
-        return;
-    }
-
+    if (!audio_engine_init()) { ESP_LOGE(TAG, "AudioEngine gagal init - WebSocket audio dibatalkan"); return; }
     log_ws_heap("before_audio_playback");
     if (!start_audio_playback()) return;
     log_ws_heap("after_audio_playback");
@@ -215,12 +189,8 @@ void websocket_app_start(void)
     cfg.buffer_size = 8192;
     ESP_LOGI(TAG, "V7.0.32 DIAGNOSTIC: PING ON, audio write timeout=3000ms, retry=1, retry_delay=30ms");
     log_ws_heap("before_websocket_client_init");
-
     client = esp_websocket_client_init(&cfg);
-    if (!client) {
-        log_ws_heap("websocket_client_init_FAILED");
-        return;
-    }
+    if (!client) { log_ws_heap("websocket_client_init_FAILED"); return; }
     log_ws_heap("after_websocket_client_init");
     esp_err_t err = esp_websocket_register_events(client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)client);
     if (err != ESP_OK) { esp_websocket_client_destroy(client); client = NULL; return; }
@@ -229,20 +199,11 @@ void websocket_app_start(void)
     ws_started = true;
 }
 
-bool websocket_is_connected(void)
-{
-    return is_connected && setup_complete && !websocket_tx_error;
-}
+bool websocket_is_connected(void) { return is_connected && setup_complete && !websocket_tx_error; }
 
 void websocket_disconnect(void)
 {
-    /* Called by audio/main task, never from websocket event callback. */
-    if (client != NULL) {
-        esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
-    }
+    if (client != NULL) esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
 }
 
-void websocket_reset_started(void)
-{
-    ws_started = false;
-}
+void websocket_reset_started(void) { ws_started = false; }
