@@ -51,6 +51,7 @@ typedef struct {
 } audio_engine_turn_t;
 
 typedef void (*audio_engine_mic_frame_cb_t)(const uint8_t *pcm, size_t len, void *ctx);
+typedef void (*audio_engine_mic_sink_cb_t)(const uint8_t *pcm, size_t len, void *ctx);
 
 /* One brain: AudioEngine owns the complete audio flow. */
 bool audio_engine_init(void);
@@ -66,6 +67,7 @@ bool audio_engine_push_model_audio_base64(const char *b64, size_t len, uint32_t 
 
 /* MIC -> AudioEngine -> listener/transport. */
 bool audio_engine_set_mic_listener(audio_engine_mic_frame_cb_t cb, void *ctx);
+bool audio_engine_set_mic_sink(audio_engine_mic_sink_cb_t cb, void *ctx);
 bool audio_engine_start_capture(void);
 void audio_engine_start_input_session(void);
 void audio_engine_stop_input_session(void);
