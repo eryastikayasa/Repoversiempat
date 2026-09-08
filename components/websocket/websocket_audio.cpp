@@ -19,6 +19,7 @@ static volatile bool audio_clear_pending = false;
 
 static StaticSemaphore_t audio_send_mutex_storage;
 static SemaphoreHandle_t audio_send_mutex = NULL;
+uint64_t audio_bytes_playback_dropped = 0;
 
 #define AUDIO_OUTPUT_SAMPLE_RATE       24000U
 #define AUDIO_OUTPUT_BYTES_PER_SEC     (AUDIO_OUTPUT_SAMPLE_RATE * 2U)
