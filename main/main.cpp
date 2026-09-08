@@ -14,6 +14,7 @@
 #include "esp_wn_models.h"
 #include "model_path.h"
 #include "driver/gpio.h"
+#include "esp_timer.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -40,6 +41,7 @@ static model_iface_data_t *wake_model = nullptr;
 static int wake_chunk_samples = 0;
 
 static volatile bool assistant_active = false;
+static volatile bool wake_requested = false;
 static volatile int reconnect_attempts = 0;
 static int64_t connect_start_us = 0;
 
@@ -108,7 +110,7 @@ static bool wakeword_init(void)
 static void wakeword_frame_cb(const uint8_t *pcm, size_t len, void *ctx)
 {
     (void)ctx;
-    if (assistant_active || !wake_iface || !wake_model || wake_chunk_samples <= 0)
+    if (assistant_active || wake_requested || !wake_iface || !wake_model || wake_chunk_samples <= 0)
         return;
 
     static int16_t wake_buffer[1024];
@@ -126,17 +128,12 @@ static void wakeword_frame_cb(const uint8_t *pcm, size_t len, void *ctx)
            incoming_samples * sizeof(int16_t));
     wake_buffer_samples += incoming_samples;
 
-    while (!assistant_active &&
+    while (!assistant_active && !wake_requested &&
            wake_buffer_samples >= (size_t)wake_chunk_samples) {
         const int result = wake_iface->detect(wake_model, wake_buffer);
         if (result > 0) {
             ESP_LOGW(TAG, ">>> WAKE WORD TERDETEKSI: HI, ESP (id=%d)", result);
-            assistant_active = true;
-            reconnect_attempts = 0;
-            connect_start_us = esp_timer_get_time();
-            audio_engine_start_input_session();
-            face_set_state(FACE_HAPPY);
-            websocket_app_start();
+            wake_requested = true;
             wake_buffer_samples = 0;
             return;
         }
@@ -153,6 +150,7 @@ static void start_assistant_session(void)
 {
     if (assistant_active) return;
     assistant_active = true;
+    wake_requested = false;
     reconnect_attempts = 0;
     connect_start_us = esp_timer_get_time();
     audio_engine_start_input_session();
@@ -166,6 +164,13 @@ static void app_supervisor_task(void *arg)
 
     for (;;) {
         if (!assistant_active) {
+            if (wake_requested) {
+                ESP_LOGI(TAG, "Wake request diterima supervisor. Memulai sesi...");
+                start_assistant_session();
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+
             if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
                 vTaskDelay(pdMS_TO_TICKS(50));
                 if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
@@ -335,6 +340,13 @@ extern "C" void app_main()
     debug_network_path();
 
     audio_engine_set_mic_listener(wake_ready ? wakeword_frame_cb : nullptr, nullptr);
+    audio_engine_set_mic_sink(
+        [](const uint8_t *pcm, size_t len, void *ctx) {
+            (void)ctx;
+            websocket_send_audio_data(pcm, len);
+        },
+        nullptr);
+
     if (!audio_engine_start_capture()) {
         ESP_LOGE(TAG, "AudioEngine capture gagal");
         display_status("Mic Engine Gagal!");
