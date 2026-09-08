@@ -1,0 +1,107 @@
+diff --git a/components/audio_hal/include/audio_hal.h b/components/audio_hal/include/audio_hal.h
+--- a/components/audio_hal/include/audio_hal.h
++++ b/components/audio_hal/include/audio_hal.h
+@@ -20,5 +20,5 @@
+ void audio_i2s_test_tone(void);
+ 
+ size_t audio_read_mic(uint8_t *dest, size_t max_len);
+ 
+-void audio_write_speaker(const uint8_t *src, size_t len);
++size_t audio_write_speaker(const uint8_t *src, size_t len);
+ diff --git a/components/audio_hal/audio_hal.cpp b/components/audio_hal/audio_hal.cpp
+--- a/components/audio_hal/audio_hal.cpp
++++ b/components/audio_hal/audio_hal.cpp
+@@ -390,7 +390,7 @@
+     return samples * sizeof(int16_t);
+ }
+ 
+-void audio_write_speaker(const uint8_t *src, size_t len)
++size_t audio_write_speaker(const uint8_t *src, size_t len)
+ {
+-    if (!tx_handle || !src || len < 2) return;
++    if (!tx_handle || !src || len < 2) return 0;
+     len &= ~((size_t)1);
+     static int32_t tx_buffer[1024];
+     static int16_t ref_pcm[240];
+@@ -421,7 +421,7 @@
+                          esp_err_to_name(err), (unsigned)written, (unsigned)(n * sizeof(int32_t)),
+                          (unsigned)I2S_WRITE_TIMEOUT_MS);
+                 vTaskDelay(1);
+-                return;
++                return offset * sizeof(int16_t);
+             }
+             // Partial write - continue loop to retry remaining
+             continue;
+@@ -429,6 +429,7 @@
+             continue;
+         }
+     }
++    return offset * sizeof(int16_t);
+ }
+ 
+ void audio_i2s_test_tone(void)
+ diff --git a/components/websocket/websocket_audio.cpp b/components/websocket/websocket_audio.cpp
+--- a/components/websocket/websocket_audio.cpp
++++ b/components/websocket/websocket_audio.cpp
+@@ -25,6 +25,8 @@
+ #define AUDIO_SEND_CHUNK_SIZE 512U
+ #define AUDIO_SEND_WAIT_MS 50
+ static volatile uint32_t audio_turn_generation = 0;
++static int64_t audio_drain_deadline_us = 0;
++constexpr int64_t AUDIO_I2S_DRAIN_MS = 20;
++
+ static size_t send_realtime_pcm(const uint8_t *data, size_t len)
+ {
+@@ -51,9 +53,19 @@
+ void check_audio_playback_complete(void)
+ {
+     if (!audio_turn_complete_pending || audio_stream == NULL) return;
+-    if (xStreamBufferBytesAvailable(audio_stream) != 0) return;
++    if (xStreamBufferBytesAvailable(audio_stream) != 0) {
++        audio_drain_deadline_us = 0;
++        return;
++    }
++
++    // The software ring is empty, but ESP-IDF notes that I2S RUNNING does not
++    // mean the last samples have already finished on the physical I2S line.
++    // Wait one 20 ms drain window without blocking the websocket task.
++    const int64_t now_us = esp_timer_get_time();
++    if (audio_drain_deadline_us == 0) {
++        audio_drain_deadline_us = now_us + (AUDIO_I2S_DRAIN_MS * 1000);
++        return;
++    }
++    if (now_us < audio_drain_deadline_us) return;
++    audio_drain_deadline_us = 0;
++
+     audio_turn_complete_pending = false;
+     audio_turn_active = false;
+     const uint64_t accounted = audio_bytes_queued + audio_bytes_dropped;
+@@ -120,8 +132,10 @@
+         if (!playback_started) { playback_started = true; face_set_state(FACE_SPEAKING); }
+         underrun_reported = false;
+-        audio_write_speaker(playback_buffer, received);
++        const size_t played = audio_write_speaker(playback_buffer, received);
+         audio_write_calls++;
+-        audio_bytes_played += received;
++        audio_bytes_played += played;
++        if (played < received)
++            ESP_LOGW(TAG, "AUDIO PLAYBACK WRITE LOSS: received=%u played=%u", (unsigned)received, (unsigned)played);
+         check_audio_playback_complete();
+@@ -185,6 +199,7 @@
+     audio_bytes_played = 0;
+     audio_bytes_dropped = 0;
++    audio_drain_deadline_us = 0;
+     audio_turn_active = false;
+     audio_turn_complete_pending = false;
+@@ -198,6 +213,7 @@
+     audio_bytes_played = 0;
+     audio_bytes_dropped = 0;
++    audio_drain_deadline_us = 0;
+ 
+     if (audio_stream != NULL) {
+@@ -222,6 +238,7 @@
+     audio_turn_generation = next_generation;
+     audio_turn_active = true;
+     audio_turn_complete_pending = false;
++    audio_drain_deadline_us = 0;
+ }
