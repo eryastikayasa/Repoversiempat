@@ -16,7 +16,7 @@ static constexpr size_t MIC_READ_BYTES = 4096U;
 static constexpr uint32_t MIC_IDLE_TIMEOUT_MS = 60000U;
 static constexpr int32_t MIC_ACTIVITY_THRESHOLD = 80;
 static constexpr size_t MIC_ACTIVITY_MIN_SAMPLES = 8U;
-static constexpr size_t WAKE_QUEUE_DEPTH = 16U;
+static constexpr size_t MIC_TX_QUEUE_DEPTH = 16U;
 
 static audio_engine_mic_frame_cb_t s_mic_listener = nullptr;
 static void *s_mic_listener_ctx = nullptr;
@@ -26,12 +26,12 @@ static volatile bool s_capture_started = false;
 static volatile bool s_input_session_active = false;
 static int64_t s_last_activity_us = 0;
 static TaskHandle_t s_capture_task = nullptr;
-static TaskHandle_t s_listener_task = nullptr;
+static TaskHandle_t s_sink_task = nullptr;
 
-static StaticQueue_t s_wake_queue_struct;
-static uint8_t s_wake_queue_storage[WAKE_QUEUE_DEPTH][MIC_FRAME_BYTES];
-static QueueHandle_t s_wake_queue = nullptr;
-static volatile uint32_t s_wake_queue_drops = 0;
+static StaticQueue_t s_tx_queue_struct;
+static uint8_t s_tx_queue_storage[MIC_TX_QUEUE_DEPTH][MIC_FRAME_BYTES];
+static QueueHandle_t s_tx_queue = nullptr;
+static volatile uint32_t s_tx_queue_drops = 0;
 
 static bool frame_has_activity(const uint8_t *data, size_t len)
 {
@@ -48,21 +48,20 @@ static bool frame_has_activity(const uint8_t *data, size_t len)
     return false;
 }
 
-static void listener_task(void *arg)
+static void sink_task(void *arg)
 {
     (void)arg;
-
     uint8_t frame[MIC_FRAME_BYTES];
-    ESP_LOGI(TAG, "Mic listener worker aktif; callback tidak lagi berjalan di capture task");
+    ESP_LOGI(TAG, "Mic transport worker aktif; capture/WakeNet tidak mengerjakan TX");
 
     for (;;) {
-        if (xQueueReceive(s_wake_queue, frame, portMAX_DELAY) != pdTRUE)
+        if (xQueueReceive(s_tx_queue, frame, portMAX_DELAY) != pdTRUE)
             continue;
 
-        audio_engine_mic_frame_cb_t listener = s_mic_listener;
-        void *listener_ctx = s_mic_listener_ctx;
-        if (listener)
-            listener(frame, MIC_FRAME_BYTES, listener_ctx);
+        audio_engine_mic_sink_cb_t sink = s_mic_sink;
+        void *sink_ctx = s_mic_sink_ctx;
+        if (sink && s_input_session_active)
+            sink(frame, MIC_FRAME_BYTES, sink_ctx);
     }
 }
 
@@ -97,18 +96,12 @@ static void capture_task(void *arg)
             frame_pos = 0;
 
             /*
-             * WakeNet/listener work is deliberately decoupled from the
-             * capture task. The capture task must return to I2S as quickly
-             * as possible so inference can never stall microphone capture.
+             * WakeNet stays directly on the realtime capture path. This
+             * preserves the old timing behavior: every 20 ms frame reaches
+             * WakeNet without waiting for a queue worker or network task.
              */
-            if (s_wake_queue && s_mic_listener) {
-                if (xQueueSend(s_wake_queue, frame_buffer, 0) != pdTRUE) {
-                    ++s_wake_queue_drops;
-                    if ((s_wake_queue_drops & 0x3FU) == 1U)
-                        ESP_LOGW(TAG, "WakeNet queue penuh; frame drop total=%u",
-                                 (unsigned)s_wake_queue_drops);
-                }
-            }
+            if (s_mic_listener)
+                s_mic_listener(frame_buffer, MIC_FRAME_BYTES, s_mic_listener_ctx);
 
             if (!s_input_session_active) continue;
 
@@ -124,8 +117,20 @@ static void capture_task(void *arg)
                 continue;
             }
 
-            if (s_mic_sink)
-                s_mic_sink(frame_buffer, MIC_FRAME_BYTES, s_mic_sink_ctx);
+            /*
+             * Never call the transport sink from the capture/WakeNet task.
+             * Only a fixed-size queue copy is performed here; malloc,
+             * memcpy into WebSocket buffers, and queue operations belonging
+             * to transport happen on the dedicated sink worker.
+             */
+            if (s_tx_queue && s_mic_sink) {
+                if (xQueueSend(s_tx_queue, frame_buffer, 0) != pdTRUE) {
+                    ++s_tx_queue_drops;
+                    if ((s_tx_queue_drops & 0x3FU) == 1U)
+                        ESP_LOGW(TAG, "MIC transport queue penuh; frame drop total=%u",
+                                 (unsigned)s_tx_queue_drops);
+                }
+            }
         }
     }
 }
@@ -148,22 +153,22 @@ bool audio_engine_start_capture(void)
 {
     if (s_capture_started) return true;
 
-    s_wake_queue = xQueueCreateStatic(
-        WAKE_QUEUE_DEPTH,
+    s_tx_queue = xQueueCreateStatic(
+        MIC_TX_QUEUE_DEPTH,
         MIC_FRAME_BYTES,
-        &s_wake_queue_storage[0][0],
-        &s_wake_queue_struct);
-    if (!s_wake_queue) {
-        ESP_LOGE(TAG, "Gagal membuat WakeNet listener queue");
+        &s_tx_queue_storage[0][0],
+        &s_tx_queue_struct);
+    if (!s_tx_queue) {
+        ESP_LOGE(TAG, "Gagal membuat MIC transport queue");
         return false;
     }
 
-    BaseType_t listener_rc = xTaskCreatePinnedToCore(
-        listener_task, "wake_listener", 8192, nullptr, 5, &s_listener_task, 0);
-    if (listener_rc != pdPASS) {
-        s_listener_task = nullptr;
-        s_wake_queue = nullptr;
-        ESP_LOGE(TAG, "Gagal membuat WakeNet listener task");
+    BaseType_t sink_rc = xTaskCreatePinnedToCore(
+        sink_task, "mic_tx", 4096, nullptr, 4, &s_sink_task, 0);
+    if (sink_rc != pdPASS) {
+        s_sink_task = nullptr;
+        s_tx_queue = nullptr;
+        ESP_LOGE(TAG, "Gagal membuat MIC transport worker");
         return false;
     }
 
@@ -171,8 +176,8 @@ bool audio_engine_start_capture(void)
         capture_task, "audio_capture", 8192, nullptr, 5, &s_capture_task, 1);
     if (rc != pdPASS) {
         s_capture_task = nullptr;
-        s_listener_task = nullptr;
-        s_wake_queue = nullptr;
+        s_sink_task = nullptr;
+        s_tx_queue = nullptr;
         ESP_LOGE(TAG, "Gagal membuat AudioEngine capture task");
         return false;
     }
