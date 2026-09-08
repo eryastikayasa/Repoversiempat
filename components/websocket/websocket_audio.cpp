@@ -31,11 +31,11 @@ uint64_t audio_bytes_playback_dropped = 0;
 #define AUDIO_RING_BUFFER_SIZE         (128U * 1024U)   // 131072 byte (≈2.7 detik audio)
 
 /* Prebuffer kecil agar playback segera dimulai */
-#define AUDIO_PLAYBACK_PREBUFFER_SIZE  (4U * 1024U)     // 4096 byte (≈85 ms)
+#define AUDIO_PLAYBACK_PREBUFFER_SIZE  (32U * 1024U)     // 4096 byte (≈85 ms)
 
 /* Threshold peringatan & kritis */
-#define AUDIO_PLAYBACK_WARNING_SIZE    (4U * 1024U)     // 4096 byte
-#define AUDIO_PLAYBACK_CRITICAL_SIZE   2400U
+#define AUDIO_PLAYBACK_WARNING_SIZE    (16U * 1024U)     // 4096 byte
+#define AUDIO_PLAYBACK_CRITICAL_SIZE   (8U * 1024U) 
 
 /* Ukuran pembacaan dari ring buffer ke I2S */
 #define AUDIO_PLAYBACK_READ_SIZE       1024U
