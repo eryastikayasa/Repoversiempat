@@ -17,3 +17,4 @@ const char *websocket_get_server_url(void);
 void websocket_app_start(void);
 void websocket_send_audio_data(const uint8_t *data, size_t len);
 bool websocket_is_connected(void);
+void websocket_disconnect(void);
