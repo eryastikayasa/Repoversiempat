@@ -16,11 +16,10 @@ static constexpr uint32_t MIC_IDLE_TIMEOUT_MS = 60000U;
 static constexpr int32_t MIC_ACTIVITY_THRESHOLD = 80;
 static constexpr size_t MIC_ACTIVITY_MIN_SAMPLES = 8U;
 
-/* Transport is inverted: AudioEngine owns capture/framing; WebSocket only sends. */
-void websocket_send_audio_data(const uint8_t *data, size_t len) __attribute__((weak));
-
 static audio_engine_mic_frame_cb_t s_mic_listener = nullptr;
 static void *s_mic_listener_ctx = nullptr;
+static audio_engine_mic_sink_cb_t s_mic_sink = nullptr;
+static void *s_mic_sink_ctx = nullptr;
 static volatile bool s_capture_started = false;
 static volatile bool s_input_session_active = false;
 static int64_t s_last_activity_us = 0;
@@ -88,8 +87,8 @@ static void capture_task(void *arg)
                 continue;
             }
 
-            if (websocket_send_audio_data)
-                websocket_send_audio_data(frame_buffer, MIC_FRAME_BYTES);
+            if (s_mic_sink)
+                s_mic_sink(frame_buffer, MIC_FRAME_BYTES, s_mic_sink_ctx);
         }
     }
 }
@@ -98,6 +97,13 @@ bool audio_engine_set_mic_listener(audio_engine_mic_frame_cb_t cb, void *ctx)
 {
     s_mic_listener = cb;
     s_mic_listener_ctx = ctx;
+    return true;
+}
+
+bool audio_engine_set_mic_sink(audio_engine_mic_sink_cb_t cb, void *ctx)
+{
+    s_mic_sink = cb;
+    s_mic_sink_ctx = ctx;
     return true;
 }
 
