@@ -16,13 +16,8 @@ static constexpr uint32_t MIC_IDLE_TIMEOUT_MS = 60000U;
 static constexpr int32_t MIC_ACTIVITY_THRESHOLD = 80;
 static constexpr size_t MIC_ACTIVITY_MIN_SAMPLES = 8U;
 
-/*
- * Transport is deliberately inverted: AudioEngine owns capture/framing,
- * while the transport supplies only this sink. No WebSocket header is needed
- * here and AudioEngine remains independent of the transport implementation.
- */
-extern "C" void websocket_send_audio_data(const uint8_t *data, size_t len)
-    __attribute__((weak));
+/* Transport is inverted: AudioEngine owns capture/framing; WebSocket only sends. */
+void websocket_send_audio_data(const uint8_t *data, size_t len) __attribute__((weak));
 
 static audio_engine_mic_frame_cb_t s_mic_listener = nullptr;
 static void *s_mic_listener_ctx = nullptr;
@@ -76,7 +71,6 @@ static void capture_task(void *arg)
             if (frame_pos != MIC_FRAME_BYTES) continue;
             frame_pos = 0;
 
-            /* Wake-word/application listener receives the same AudioEngine-owned frame. */
             if (s_mic_listener)
                 s_mic_listener(frame_buffer, MIC_FRAME_BYTES, s_mic_listener_ctx);
 
@@ -112,7 +106,7 @@ bool audio_engine_start_capture(void)
     if (s_capture_started) return true;
 
     BaseType_t rc = xTaskCreatePinnedToCore(
-        capture_task, "audio_capture", 4096, nullptr, 5, &s_capture_task, 0);
+        capture_task, "audio_capture", 4096, nullptr, 5, &s_capture_task, 1);
     if (rc != pdPASS) {
         s_capture_task = nullptr;
         ESP_LOGE(TAG, "Gagal membuat AudioEngine capture task");
