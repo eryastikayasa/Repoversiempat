@@ -25,11 +25,6 @@ typedef enum {
     AUDIO_ENGINE_EVENT_MODEL_BEGIN,
     AUDIO_ENGINE_EVENT_MODEL_AUDIO,
     AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE,
-    /* Reserved legacy/internal notifications; external callers should not use these. */
-    AUDIO_ENGINE_EVENT_PLAYBACK_STARTED,
-    AUDIO_ENGINE_EVENT_PLAYBACK_LOW,
-    AUDIO_ENGINE_EVENT_PLAYBACK_DRAINED,
-    AUDIO_ENGINE_EVENT_I2S_DRAINED,
     AUDIO_ENGINE_EVENT_INTERRUPT,
     AUDIO_ENGINE_EVENT_GENERATION_CHANGED,
     AUDIO_ENGINE_EVENT_ERROR
@@ -72,13 +67,6 @@ bool audio_engine_start_capture(void);
 void audio_engine_start_input_session(void);
 void audio_engine_stop_input_session(void);
 bool audio_engine_input_session_active(void);
-
-/* Session/turn controls. */
-void audio_engine_clear_buffer(void);
-void audio_engine_reset_turn_stats(void);
-void audio_engine_begin_turn(uint32_t generation);
-void audio_engine_request_clear(void);
-size_t audio_engine_get_pending_bytes(void);
 
 #ifdef __cplusplus
 }
