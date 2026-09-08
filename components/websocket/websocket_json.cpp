@@ -450,22 +450,17 @@ void process_gemini_message(const char *json, size_t len)
 
         cJSON *turn_complete = cJSON_GetObjectItem(server, "turnComplete");
         if (cJSON_IsTrue(turn_complete)) {
-            audio_turn_complete_pending = true;
-            size_t pending = get_audio_pending_bytes();
-            ESP_LOGI(TAG, "Gemini: TURN COMPLETE - menunggu audio drain");
-            ESP_LOGI(TAG, "AUDIO SUMMARY: chunks=%u received=%llu played=%llu pending=%u write_calls=%u",
-                     (unsigned)audio_chunks_received, (unsigned long long)audio_bytes_received,
-                     (unsigned long long)audio_bytes_played, (unsigned)pending,
-                     (unsigned)audio_write_calls);
-            if (pending == 0) check_audio_playback_complete();
+            ESP_LOGI(TAG, "Gemini: TURN COMPLETE - audio engine menunggu playback drain");
+            audio_engine_notify(AUDIO_ENGINE_EVENT_MODEL_TURN_COMPLETE,
+                                websocket_connection_generation);
         }
 
         cJSON *interrupted = cJSON_GetObjectItem(server, "interrupted");
         if (cJSON_IsTrue(interrupted)) {
-            ESP_LOGW(TAG, "Gemini: RESPONSE INTERRUPTED");
-            clear_audio_buffer();
-            audio_turn_complete_pending = false;
-            audio_turn_active = false;
+            ESP_LOGW(TAG, "Gemini: RESPONSE INTERRUPTED - audio engine reset playback");
+            audio_engine_notify(AUDIO_ENGINE_EVENT_INTERRUPT,
+                                websocket_connection_generation);
+            request_audio_buffer_clear();
         }
     }
 
