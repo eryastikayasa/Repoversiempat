@@ -1,5 +1,4 @@
 #pragma once
-
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -50,16 +49,37 @@ typedef struct {
     size_t pending_bytes;
 } audio_engine_turn_t;
 
+/* One brain: WebSocket only hands PCM to AudioEngine. */
 bool audio_engine_init(void);
 audio_engine_state_t audio_engine_get_state(void);
 const char *audio_engine_state_name(audio_engine_state_t state);
 bool audio_engine_turn_active(void);
 const audio_engine_turn_t *audio_engine_get_turn(void);
 void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation);
-void audio_engine_note_audio(size_t bytes);
+
+/* Gemini -> AudioEngine. Buffer, playback decisions and accounting live here. */
+bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t generation);
+
+/* Session/turn controls owned by AudioEngine. */
+void audio_engine_clear_buffer(void);
+void audio_engine_reset_turn_stats(void);
+void audio_engine_begin_turn(uint32_t generation);
+void audio_engine_request_clear(void);
+size_t audio_engine_get_pending_bytes(void);
+
+/* Playback executor reports what the I2S path actually accepted. */
 void audio_engine_note_playback(size_t bytes);
 void audio_engine_note_underrun(void);
-void audio_engine_sync_legacy_state(void);
+
+/* Temporary compatibility aliases for existing callers. */
+bool start_audio_playback(void);
+void clear_audio_buffer(void);
+void request_audio_buffer_clear(void);
+void reset_audio_turn_stats(void);
+void begin_audio_turn(void);
+size_t get_audio_pending_bytes(void);
+bool queue_audio_pcm(const uint8_t *pcm, size_t len);
+void check_audio_playback_complete(void);
 
 #ifdef __cplusplus
 }
