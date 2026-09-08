@@ -12,11 +12,15 @@ permissions:
   contents: read
   actions: read
 
+concurrency:
+  group: wakenet-audit-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   audit:
     name: Verify WakeNet9 Hi ESP
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - name: Checkout firmware source
         uses: actions/checkout@v4
