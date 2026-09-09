@@ -217,6 +217,9 @@ static void finish_playback_if_drained(size_t pending)
              (unsigned long)s_turn.underrun_count);
 
     face_set_state(FACE_LISTENING);
+    /* Consume the completion event so the idle playback loop cannot complete
+     * the same turn repeatedly. A new model turn will set this true again. */
+    s_turn.model_complete = false;
     set_state(AUDIO_ENGINE_IDLE);
 }
 
