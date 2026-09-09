@@ -34,6 +34,14 @@ static uint32_t rx_invalid_json = 0;
 static uint32_t rx_oversize_drops = 0;
 static uint32_t rx_largest_payload = 0;
 
+/*
+ * The transport worker must stay transport-only. Gemini JSON parsing can
+ * allocate heavily and can take substantially longer than assembling a WS
+ * message, so it runs in a separate worker with its own larger stack.
+ */
+static QueueHandle_t gemini_rx_queue = NULL;
+static TaskHandle_t gemini_rx_task_handle = NULL;
+
 static void release_slot(uint8_t slot_id)
 {
     if (slot_id < WS_RX_SLOT_COUNT) rx_slot_in_use[slot_id] = false;
@@ -147,6 +155,46 @@ static void reset_capture_state(void)
     rx_active = false;
 }
 
+static void gemini_rx_task(void *arg)
+{
+    (void)arg;
+    ws_rx_command_t cmd = {};
+    ESP_LOGI(TAG, "Gemini RX worker dimulai - protocol processing isolated from transport");
+
+    for (;;) {
+        if (xQueueReceive(gemini_rx_queue, &cmd, portMAX_DELAY) != pdTRUE)
+            continue;
+
+        if (!cmd.buffer || cmd.len == 0) {
+            free_command(&cmd);
+            memset(&cmd, 0, sizeof(cmd));
+            continue;
+        }
+
+        if (cmd.generation != websocket_connection_generation || !is_connected) {
+            free_command(&cmd);
+            memset(&cmd, 0, sizeof(cmd));
+            continue;
+        }
+
+        const size_t heap_before = esp_get_free_heap_size();
+        const size_t largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        const int64_t start_us = esp_timer_get_time();
+
+        process_gemini_message((const char *)cmd.buffer, (size_t)cmd.len);
+
+        const uint32_t process_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
+        const size_t heap_after = esp_get_free_heap_size();
+        const size_t largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        ++rx_complete_messages;
+        log_rx_stats("processed", cmd.len, process_ms,
+                     heap_before, heap_after, largest_before, largest_after);
+
+        free_command(&cmd);
+        memset(&cmd, 0, sizeof(cmd));
+    }
+}
+
 static void websocket_rx_task(void *arg)
 {
     (void)arg;
@@ -179,20 +227,17 @@ static void websocket_rx_task(void *arg)
             continue;
         }
 
-        const size_t heap_before = esp_get_free_heap_size();
-        const size_t largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        const int64_t start_us = esp_timer_get_time();
+        if (xQueueSend(gemini_rx_queue, &cmd, 0) != pdTRUE) {
+            ++rx_fragments_dropped;
+            ++rx_queue_drops;
+            free_command(&cmd);
+            memset(&cmd, 0, sizeof(cmd));
+            continue;
+        }
 
-        process_gemini_message((const char *)cmd.buffer, (size_t)cmd.len);
+        const UBaseType_t waiting = uxQueueMessagesWaiting(websocket_rx_queue);
+        if (waiting > rx_queue_high_water) rx_queue_high_water = waiting;
 
-        const uint32_t process_ms = (uint32_t)((esp_timer_get_time() - start_us) / 1000);
-        const size_t heap_after = esp_get_free_heap_size();
-        const size_t largest_after = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
-        ++rx_complete_messages;
-        log_rx_stats("processed", cmd.len, process_ms,
-                     heap_before, heap_after, largest_before, largest_after);
-
-        free_command(&cmd);
         memset(&cmd, 0, sizeof(cmd));
     }
 }
@@ -207,10 +252,26 @@ bool websocket_rx_init(void)
         }
     }
 
+    if (!gemini_rx_queue) {
+        gemini_rx_queue = xQueueCreate(WS_RX_QUEUE_LENGTH, sizeof(ws_rx_command_t));
+        if (!gemini_rx_queue) {
+            ESP_LOGE(TAG, "Gagal membuat Gemini RX queue");
+            return false;
+        }
+    }
+
     if (!preallocate_rx_slots()) return false;
 
+    if (!gemini_rx_task_handle) {
+        if (xTaskCreate(gemini_rx_task, "gemini_rx", 12288, NULL, 4,
+                        &gemini_rx_task_handle) != pdPASS) {
+            ESP_LOGE(TAG, "Gagal membuat Gemini RX worker");
+            return false;
+        }
+    }
+
     if (!websocket_rx_task_handle) {
-        if (xTaskCreate(websocket_rx_task, "ws_rx", 8192, NULL, 4,
+        if (xTaskCreate(websocket_rx_task, "ws_rx", 6144, NULL, 4,
                         &websocket_rx_task_handle) != pdPASS) {
             ESP_LOGE(TAG, "Gagal membuat RX worker");
             return false;
@@ -226,16 +287,27 @@ void websocket_rx_request_reset(void)
 
 void websocket_rx_flush_queue(void)
 {
-    if (!websocket_rx_queue) return;
-
-    ws_rx_command_t stale = {};
-    size_t flushed = 0;
-    while (xQueueReceive(websocket_rx_queue, &stale, 0) == pdTRUE) {
-        release_slot(stale.slot_id);
-        ++flushed;
+    if (websocket_rx_queue) {
+        ws_rx_command_t stale = {};
+        size_t flushed = 0;
+        while (xQueueReceive(websocket_rx_queue, &stale, 0) == pdTRUE) {
+            release_slot(stale.slot_id);
+            ++flushed;
+        }
+        if (flushed)
+            ESP_LOGW(TAG, "RX transport queue dibersihkan: %u message", (unsigned)flushed);
     }
-    if (flushed)
-        ESP_LOGW(TAG, "RX queue dibersihkan: %u message", (unsigned)flushed);
+
+    if (gemini_rx_queue) {
+        ws_rx_command_t stale = {};
+        size_t flushed = 0;
+        while (xQueueReceive(gemini_rx_queue, &stale, 0) == pdTRUE) {
+            release_slot(stale.slot_id);
+            ++flushed;
+        }
+        if (flushed)
+            ESP_LOGW(TAG, "Gemini protocol queue dibersihkan: %u message", (unsigned)flushed);
+    }
 }
 
 void websocket_rx_note_invalid_json(size_t len)
