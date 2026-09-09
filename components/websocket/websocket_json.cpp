@@ -3,7 +3,7 @@
 #include "display.h"
 #include "audio_hal.h"
 #include "uart_control.h"
-
+#include "display_face.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "cJSON.h"
@@ -240,15 +240,38 @@ static void process_gemini_tool_call(cJSON *tool_call)
             cJSON *command = cJSON_GetObjectItem(args, "command");
             if (cJSON_IsString(command) && command->valuestring) {
                 const char *cmd = command->valuestring;
-                if (strcmp(cmd, "face_idle") == 0) { face_show_for_ms(FACE_IDLE, 5000); success = true; }
-                else if (strcmp(cmd, "face_listening") == 0) { face_show_for_ms(FACE_LISTENING, 5000); success = true; }
-                else if (strcmp(cmd, "face_thinking") == 0) { face_show_for_ms(FACE_THINKING, 5000); success = true; }
-                else if (strcmp(cmd, "face_speaking") == 0) { face_show_for_ms(FACE_SPEAKING, 5000); success = true; }
-                else if (strcmp(cmd, "face_happy") == 0) { face_show_for_ms(FACE_HAPPY, 5000); success = true; }
-                else if (strcmp(cmd, "face_sad") == 0) { face_show_for_ms(FACE_SAD, 5000); success = true; }
-                else if (strcmp(cmd, "face_error") == 0) { face_show_for_ms(FACE_ERROR, 5000); success = true; }
-                else if (strcmp(cmd, "face_sleep") == 0) { face_show_for_ms(FACE_SLEEP, 5000); success = true; }
-                else { success = uart_control_execute_command(cmd); ESP_LOGI(TAG, "UART TOOL command=%s result=%s", cmd, success ? "OK" : "REJECTED"); }
+                if (strcmp(cmd, "face_idle") == 0) {
+    display_face_show_for_ms(FACE_IDLE, 5000);
+    success = true;
+}
+else if (strcmp(cmd, "face_listening") == 0) {
+    display_face_show_for_ms(FACE_LISTENING, 5000);
+    success = true;
+}
+else if (strcmp(cmd, "face_thinking") == 0) {
+    display_face_show_for_ms(FACE_THINKING, 5000);
+    success = true;
+}
+else if (strcmp(cmd, "face_speaking") == 0) {
+    display_face_show_for_ms(FACE_SPEAKING, 5000);
+    success = true;
+}
+else if (strcmp(cmd, "face_happy") == 0) {
+    display_face_show_for_ms(FACE_HAPPY, 5000);
+    success = true;
+}
+else if (strcmp(cmd, "face_sad") == 0) {
+    display_face_show_for_ms(FACE_SAD, 5000);
+    success = true;
+}
+else if (strcmp(cmd, "face_error") == 0) {
+    display_face_show_for_ms(FACE_ERROR, 5000);
+    success = true;
+}
+else if (strcmp(cmd, "face_sleep") == 0) {
+    display_face_show_for_ms(FACE_SLEEP, 5000);
+    success = true;
+}  
             } else {
                 ESP_LOGW(TAG, "control_device tanpa argument command");
             }
