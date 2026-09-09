@@ -1,6 +1,5 @@
 #include "audio_engine.h"
 #include "audio_hal.h"
-#include "display.h"
 #include "display_face.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
