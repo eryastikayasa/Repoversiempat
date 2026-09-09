@@ -1,13 +1,10 @@
 idf_component_register(
     SRCS
-        "display.cpp"
-        "face_animation.cpp"
         "display_engine/display_engine.cpp"
         "display_face/display_face.cpp"
         "display_text/display_text.cpp"
         "display_driver/display_driver.cpp"
     INCLUDE_DIRS
-        "include"
         "display_engine"
         "display_face"
         "display_text"
