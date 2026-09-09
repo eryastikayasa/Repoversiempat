@@ -18,6 +18,16 @@ static TaskHandle_t s_display_engine_task = nullptr;
 static bool s_initialized = false;
 static volatile bool s_running = false;
 
+static void overlay_text(void)
+{
+    const uint8_t *text = display_text_buffer();
+    if (!text) return;
+
+    for (size_t i = 0; i < sizeof(s_final_buffer); ++i) {
+        s_final_buffer[i] |= text[i];
+    }
+}
+
 static void compose_frame(void)
 {
     const uint8_t *face = display_face_buffer();
@@ -26,24 +36,21 @@ static void compose_frame(void)
         return;
     }
 
+    // Legacy layout: Face remains the full 128x64 base framebuffer.
     memcpy(s_final_buffer, face, sizeof(s_final_buffer));
 
-    // Preserve the legacy display behavior: conversation text is rendered
-    // only for LISTENING and SPEAKING, then overlaid on the face framebuffer.
+    // Legacy ordering: RSSI + conversation/status text are overlays on top
+    // of the face, never a separate fixed-height panel.
     const face_state_t state = display_face_get_state();
     if (state == FACE_LISTENING) {
         display_text_render_user();
+        overlay_text();
     } else if (state == FACE_SPEAKING) {
         display_text_render_gemini();
+        overlay_text();
     } else {
-        return;
-    }
-
-    const uint8_t *text = display_text_buffer();
-    if (!text) return;
-
-    for (size_t i = 0; i < sizeof(s_final_buffer); ++i) {
-        s_final_buffer[i] |= text[i];
+        display_text_render_status();
+        overlay_text();
     }
 }
 
@@ -77,6 +84,7 @@ void display_engine_init(void)
     if (s_initialized) return;
 
     memset(s_final_buffer, 0, sizeof(s_final_buffer));
+    display_driver_init();
     s_initialized = true;
 }
 
