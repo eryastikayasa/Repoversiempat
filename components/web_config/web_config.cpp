@@ -218,7 +218,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t save_post_handler(httpd_req_t *req)
 {
-    static EXT_RAM_BSS_ATTR char content[2048];
+    static EXT_RAM_BSS_ATTR char content[8192];
     int total = 0;
     while (total < (int)sizeof(content) - 1) {
         int received = httpd_req_recv(req, content + total, sizeof(content) - 1 - total);
@@ -230,7 +230,7 @@ static esp_err_t save_post_handler(httpd_req_t *req)
     char wifi_ssid[64] = "";
     char wifi_pass[64] = "";
     char api_key[128] = "";
-    char role_text[512] = "";
+    char role_text[2048] = "";
 
     char *saveptr = NULL;
     char *token = strtok_r(content, "&", &saveptr);
@@ -240,7 +240,7 @@ static esp_err_t save_post_handler(httpd_req_t *req)
             *eq = '\0';
             const char *key = token;
             const char *value = eq + 1;
-            char decoded[512] = "";
+            char decoded[2048] = "";
             url_decode(decoded, sizeof(decoded), value);
 
             if (strcmp(key, "wifi_ssid") == 0) {

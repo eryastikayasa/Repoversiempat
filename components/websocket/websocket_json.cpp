@@ -157,7 +157,7 @@ bool build_gemini_setup(char **output, size_t *output_len)
     "Setiap command Face akan tampil selama 5 detik lalu kembali ke ekspresi sebelumnya. "
     "Tunggu hasil fungsi sebelum menyatakan tombol berhasil ditekan. Jangan pernah mengucapkan nama command UART kepada pengguna.");
     cJSON_AddItemToArray(system_parts, system_text);
-    static char role_text[512];
+    static char role_text[2048];
     if (web_config_load_role(role_text, sizeof(role_text)) && role_text[0] != '\0') {
         cJSON *role_part = cJSON_CreateObject();
         if (role_part) {
