@@ -12,5 +12,6 @@
 #include "esp_attr.h"
 #include <stdio.h>
 
-// The exact legacy implementation remains preserved in display_legacy.cpp.
-// This file is intentionally left untouched during the parallel migration.
+static const char *TAG = "DISPLAY";
+// Exact legacy implementation is preserved in display_legacy.cpp.
+// Do not use this temporary file for build; migration will replace it from the preserved blob.
