@@ -5,6 +5,7 @@ idf_component_register(
         "display_text/display_text.cpp"
         "display_driver/display_driver.cpp"
     INCLUDE_DIRS
+        "."
         "display_engine"
         "display_face"
         "display_text"
