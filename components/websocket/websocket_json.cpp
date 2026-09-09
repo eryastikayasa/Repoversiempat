@@ -3,6 +3,7 @@
 #include "audio_hal.h"
 #include "uart_control.h"
 #include "display_face.h"
+#include "display_text.h"
 #include "esp_log.h"
 #include "esp_system.h"
 #include "cJSON.h"
@@ -292,7 +293,7 @@ void process_gemini_message(const char *json, size_t len)
     if (cJSON_IsObject(setup_complete_obj)) {
         setup_complete = true;
         ESP_LOGI(TAG, "Gemini setupComplete: SESI SIAP");
-        display_status("AI Siap!");
+        display_text_set_status("AI Siap!");
         cJSON_Delete(root);
         return;
     }
@@ -305,7 +306,7 @@ void process_gemini_message(const char *json, size_t len)
         cJSON *text = cJSON_GetObjectItem(input_transcription, "text");
         if (cJSON_IsString(text) && text->valuestring) {
             ESP_LOGI(TAG, "USER: %s", text->valuestring);
-            display_set_user_text(text->valuestring);
+            display_text_set_user(text->valuestring);
         }
     }
 
@@ -314,7 +315,7 @@ void process_gemini_message(const char *json, size_t len)
         cJSON *text = cJSON_GetObjectItem(output_transcription, "text");
         if (cJSON_IsString(text) && text->valuestring) {
             ESP_LOGI(TAG, "GEMINI TEXT: %s", text->valuestring);
-            display_set_gemini_text(text->valuestring);
+            display_text_set_gemini(text->valuestring);
         }
     }
 
@@ -323,7 +324,7 @@ void process_gemini_message(const char *json, size_t len)
         cJSON *interim_input_transcription = cJSON_GetObjectItem(server, "interimInputTranscription");
         if (cJSON_IsObject(interim_input_transcription)) {
             cJSON *text = cJSON_GetObjectItem(interim_input_transcription, "text");
-            if (cJSON_IsString(text) && text->valuestring) display_set_user_text(text->valuestring);
+            if (cJSON_IsString(text) && text->valuestring) display_text_set_user(text->valuestring);
         }
 
         cJSON *server_input_transcription = cJSON_GetObjectItem(server, "inputTranscription");
@@ -331,7 +332,7 @@ void process_gemini_message(const char *json, size_t len)
             cJSON *text = cJSON_GetObjectItem(server_input_transcription, "text");
             if (cJSON_IsString(text) && text->valuestring) {
                 ESP_LOGI(TAG, "USER: %s", text->valuestring);
-                display_set_user_text(text->valuestring);
+                display_text_set_user(text->valuestring);
             }
         }
 
@@ -340,7 +341,7 @@ void process_gemini_message(const char *json, size_t len)
             cJSON *text = cJSON_GetObjectItem(server_output_transcription, "text");
             if (cJSON_IsString(text) && text->valuestring) {
                 ESP_LOGI(TAG, "GEMINI TEXT: %s", text->valuestring);
-                display_append_gemini_text(text->valuestring);
+                display_text_append_gemini(text->valuestring);
             }
         }
 
