@@ -274,7 +274,8 @@ void display_face_init(void)
             .callback = &face_override_expired,
             .arg = nullptr,
             .dispatch_method = ESP_TIMER_TASK,
-            .name = "face_override"
+            .name = "face_override",
+            .skip_unhandled_events = false
         };
         esp_timer_create(&args, &s_face_override_timer);
     }
