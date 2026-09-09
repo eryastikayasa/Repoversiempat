@@ -31,7 +31,7 @@ static TaskHandle_t s_sink_task = nullptr;
 static StaticQueue_t s_tx_queue_struct;
 static uint8_t s_tx_queue_storage[MIC_TX_QUEUE_DEPTH][MIC_FRAME_BYTES];
 static QueueHandle_t s_tx_queue = nullptr;
-static volatile uint32_t s_tx_queue_drops = 0;
+static uint32_t s_tx_queue_drops = 0;
 
 static bool frame_has_activity(const uint8_t *data, size_t len)
 {
