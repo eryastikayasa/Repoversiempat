@@ -1,4 +1,4 @@
-#include "display.h"
+#include "display_face.h"
 #include "wifi_manager.h"
 #include "websocket_mgr.h"
 #include "audio_hal.h"
@@ -154,7 +154,7 @@ static void start_assistant_session(void)
     reconnect_attempts = 0;
     connect_start_us = esp_timer_get_time();
     audio_engine_start_input_session();
-    face_set_state(FACE_HAPPY);
+    display_face_set_state(FACE_HAPPY);
     websocket_app_start();
 }
 
@@ -189,7 +189,7 @@ static void app_supervisor_task(void *arg)
             ESP_LOGI(TAG, "AudioEngine mengakhiri sesi MIC");
             assistant_active = false;
             websocket_disconnect();
-            face_set_state(FACE_SLEEP);
+            display_face_set_state(FACE_SLEEP);
             reconnect_attempts = 0;
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
@@ -209,7 +209,7 @@ static void app_supervisor_task(void *arg)
                     ESP_LOGW(TAG, "Reconnect gagal, kembali ke mode sleep.");
                     assistant_active = false;
                     audio_engine_stop_input_session();
-                    face_set_state(FACE_SLEEP);
+                    display_face_set_state(FACE_SLEEP);
                     reconnect_attempts = 0;
                 }
             } else {
@@ -273,19 +273,15 @@ extern "C" void app_main()
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    oled_init();
-    face_animation_start();
-    face_set_state(FACE_SLEEP);
+    display_face_init();
+    display_face_set_state(FACE_SLEEP);
     display_status("Booting...");
 
-    /* Restore the startup order from the known-good firmware:
-     * Audio HAL + AudioEngine are created before WiFi/WakeNet, but
-     * microphone capture itself still starts only after NTP is ready. */
     audio_hal_init();
     if (!audio_engine_init()) {
         ESP_LOGE(TAG, "AudioEngine init gagal");
         display_status("Audio Engine Gagal!");
-        face_set_state(FACE_ERROR);
+        display_face_set_state(FACE_ERROR);
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
@@ -298,7 +294,7 @@ extern "C" void app_main()
     if (!wifi_wait_for_connection(15000)) {
         ESP_LOGE(TAG, "Wi-Fi tidak mendapatkan IP.");
         display_status("WiFi Gagal!");
-        face_set_state(FACE_ERROR);
+        display_face_set_state(FACE_ERROR);
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
@@ -325,12 +321,12 @@ extern "C" void app_main()
     if (!audio_engine_start_capture()) {
         ESP_LOGE(TAG, "AudioEngine capture gagal");
         display_status("Mic Engine Gagal!");
-        face_set_state(FACE_ERROR);
+        display_face_set_state(FACE_ERROR);
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     display_status("WakeNet mendengar...");
-    face_set_state(FACE_SLEEP);
+    display_face_set_state(FACE_SLEEP);
     display_status("Sistem siap. Katakan Hi, ESP...");
 
     BaseType_t task_result = xTaskCreate(
