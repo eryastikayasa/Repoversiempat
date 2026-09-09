@@ -2,6 +2,7 @@
 
 #include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
+#include "esp_attr.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -10,7 +11,7 @@ namespace {
 constexpr int OLED_WIDTH = 128;
 constexpr int OLED_HEIGHT = 64;
 
-static uint8_t s_text_buffer[OLED_WIDTH * OLED_HEIGHT / 8] = {0};
+static EXT_RAM_BSS_ATTR uint8_t s_text_buffer[OLED_WIDTH * OLED_HEIGHT / 8] = {0};
 static char s_user_scroll_text[256] = {0};
 static char s_gemini_scroll_text[256] = {0};
 static char s_status_text[64] = {0};
