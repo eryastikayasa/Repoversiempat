@@ -1,5 +1,6 @@
 #include "display_face.h"
 #include "display_text.h"
+#include "display_engine.h"
 #include "wifi_manager.h"
 #include "websocket_mgr.h"
 #include "audio_hal.h"
@@ -276,6 +277,8 @@ extern "C" void app_main()
 
     display_face_init();
     display_text_init();
+    display_engine_init();
+    display_engine_start();
     display_face_set_state(FACE_SLEEP);
     display_text_set_status("Booting...");
 
