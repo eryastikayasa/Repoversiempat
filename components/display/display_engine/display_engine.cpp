@@ -4,6 +4,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
+#include "esp_attr.h"
 #include "display_face.h"
 #include "display_text.h"
 #include "display_driver.h"
@@ -13,7 +14,7 @@ namespace {
 constexpr int DISPLAY_ENGINE_FRAME_MS = 33;
 constexpr size_t DISPLAY_FRAMEBUFFER_SIZE = DISPLAY_FACE_BUFFER_SIZE;
 
-static uint8_t s_final_buffer[DISPLAY_FRAMEBUFFER_SIZE] = {0};
+static EXT_RAM_BSS_ATTR uint8_t s_final_buffer[DISPLAY_FRAMEBUFFER_SIZE] = {0};
 static TaskHandle_t s_display_engine_task = nullptr;
 static bool s_initialized = false;
 static volatile bool s_running = false;
