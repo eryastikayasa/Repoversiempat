@@ -1,6 +1,7 @@
 #include "display_text.h"
 
 #include "esp_wifi.h"
+#include "freertos/FreeRTOS.h"
 #include <string.h>
 #include <stdio.h>
 
@@ -88,9 +89,8 @@ static void draw_scrolling_text(const char *text, uint16_t &offset, int text_x)
     if (visible_width <= 5) return;
 
     if (text_px <= visible_width) {
-        for (size_t i = 0; i < len; ++i) {
+        for (size_t i = 0; i < len; ++i)
             draw_text_char(text_x + (int)i * CHAR_WIDTH, TEXT_Y, text[i]);
-        }
         offset = 0;
         return;
     }
@@ -148,16 +148,11 @@ static void draw_rssi_char(int x, int y, char c)
 {
     static const uint8_t glyphs[][5] = {
         {0x00,0x00,0x1F,0x00,0x00},
-        {0x1E,0x11,0x11,0x11,0x1E},
-        {0x00,0x12,0x1F,0x10,0x00},
-        {0x12,0x19,0x15,0x13,0x12},
-        {0x11,0x15,0x15,0x15,0x0A},
-        {0x07,0x04,0x04,0x1F,0x04},
-        {0x17,0x15,0x15,0x15,0x09},
-        {0x0E,0x15,0x15,0x15,0x08},
-        {0x01,0x01,0x19,0x05,0x03},
-        {0x0A,0x15,0x15,0x15,0x0A},
-        {0x02,0x15,0x15,0x15,0x0E},
+        {0x1E,0x11,0x11,0x11,0x1E}, {0x00,0x12,0x1F,0x10,0x00},
+        {0x12,0x19,0x15,0x13,0x12}, {0x11,0x15,0x15,0x15,0x0A},
+        {0x07,0x04,0x04,0x1F,0x04}, {0x17,0x15,0x15,0x15,0x09},
+        {0x0E,0x15,0x15,0x15,0x08}, {0x01,0x01,0x19,0x05,0x03},
+        {0x0A,0x15,0x15,0x15,0x0A}, {0x02,0x15,0x15,0x15,0x0E},
     };
 
     int index = (c == '-') ? 0 : (c - '0' + 1);
@@ -191,7 +186,6 @@ static int draw_rssi(void)
     const int char_width = 6;
     int x = 0;
     const int y = OLED_HEIGHT - 5;
-
     for (size_t i = 0; text[i] != '\0'; ++i) {
         draw_rssi_char(x, y, text[i]);
         x += char_width;
@@ -250,8 +244,7 @@ void display_text_render_user(void)
 
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
     const int rssi_end_x = draw_rssi();
-    const int text_x = rssi_end_x > 0 ? rssi_end_x + 4 : 4;
-    draw_scrolling_text(text, offset, text_x);
+    draw_scrolling_text(text, offset, rssi_end_x > 0 ? rssi_end_x + 4 : 4);
 
     portENTER_CRITICAL(&s_scroll_text_mux);
     s_user_scroll_offset = offset;
@@ -269,8 +262,7 @@ void display_text_render_gemini(void)
 
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
     const int rssi_end_x = draw_rssi();
-    const int text_x = rssi_end_x > 0 ? rssi_end_x + 4 : 4;
-    draw_scrolling_text(text, offset, text_x);
+    draw_scrolling_text(text, offset, rssi_end_x > 0 ? rssi_end_x + 4 : 4);
 
     portENTER_CRITICAL(&s_scroll_text_mux);
     s_gemini_scroll_offset = offset;
