@@ -278,22 +278,11 @@ extern "C" void app_main()
     face_set_state(FACE_SLEEP);
     display_status("Booting...");
 
-    audio_hal_init();
-
-    if (!audio_engine_init()) {
-        ESP_LOGE(TAG, "AudioEngine init gagal");
-        display_status("Audio Engine Gagal!");
-        face_set_state(FACE_ERROR);
-        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
     gpio_set_direction(BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);
     gpio_set_pull_mode(BOOT_BUTTON_GPIO, GPIO_PULLUP_ONLY);
     uart_control_init();
 
-    /* Network and NTP must be ready before WakeNet is created and before
-     * AudioEngine starts reading the microphone. This restores the known-good
-     * startup ordering used by the build that successfully detected HI, ESP. */
+    /* Boot -> WiFi -> NTP must complete before the audio subsystem is created. */
     display_status("Menghubungkan WiFi...");
     wifi_init_sta();
     if (!wifi_wait_for_connection(15000)) {
@@ -307,14 +296,23 @@ extern "C" void app_main()
     ESP_LOGI(TAG, "WiFi power save dimatikan");
     sync_sntp_time();
 
-    /* Only after WiFi/NTP are complete: initialize WakeNet, then start the
-     * AudioEngine capture path that feeds audio_read_mic() into WakeNet. */
+    /* WakeNet must be fully ready before AudioEngine is initialized. */
     const bool wake_ready = wakeword_init();
     if (!wake_ready) {
         ESP_LOGE(TAG, "WakeNet init gagal. Sistem tetap bisa dimulai dengan tombol BOOT.");
         display_status("WakeNet gagal!");
     } else {
         display_status("WakeNet siap. Katakan: Hi, ESP");
+    }
+
+    /* Audio hardware is initialized immediately before AudioEngine so the
+     * requested startup order is: WakeNet READY -> AudioEngine init -> mic. */
+    audio_hal_init();
+    if (!audio_engine_init()) {
+        ESP_LOGE(TAG, "AudioEngine init gagal");
+        display_status("Audio Engine Gagal!");
+        face_set_state(FACE_ERROR);
+        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     audio_engine_set_mic_listener(wake_ready ? wakeword_frame_cb : nullptr, nullptr);
