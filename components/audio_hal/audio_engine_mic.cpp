@@ -73,8 +73,9 @@ static void capture_task(void *arg)
     static uint8_t frame_buffer[MIC_FRAME_BYTES];
     size_t frame_pos = 0;
 
-    ESP_LOGI(TAG, "Mic capture owner aktif: PCM16 16kHz, frame=%uB, idle=%ums, stack=8192",
-             (unsigned)MIC_FRAME_BYTES, (unsigned)MIC_IDLE_TIMEOUT_MS);
+    ESP_LOGI(TAG, "Mic capture owner aktif: PCM16 16kHz, frame=%uB, read=%uB, idle=%ums, stack=8192",
+             (unsigned)MIC_FRAME_BYTES, (unsigned)MIC_READ_BYTES,
+             (unsigned)MIC_IDLE_TIMEOUT_MS);
 
     for (;;) {
         const size_t bytes = audio_read_mic(read_buffer, sizeof(read_buffer));
@@ -82,6 +83,16 @@ static void capture_task(void *arg)
             vTaskDelay(1);
             continue;
         }
+
+        /*
+         * WakeNet receives the same contiguous PCM read that comes out of
+         * the Audio HAL. This is intentionally closer to the proven
+         * Repoversitiga path: I2S/Audio HAL -> PCM buffer -> WakeNet detect.
+         * AudioEngine remains the single microphone owner; only the transport
+         * side is framed into 320-byte packets.
+         */
+        if (s_mic_listener)
+            s_mic_listener(read_buffer, bytes, s_mic_listener_ctx);
 
         size_t offset = 0;
         while (offset < bytes) {
@@ -94,14 +105,6 @@ static void capture_task(void *arg)
 
             if (frame_pos != MIC_FRAME_BYTES) continue;
             frame_pos = 0;
-
-            /*
-             * WakeNet stays directly on the realtime capture path. This
-             * preserves the old timing behavior: every 20 ms frame reaches
-             * WakeNet without waiting for a queue worker or network task.
-             */
-            if (s_mic_listener)
-                s_mic_listener(frame_buffer, MIC_FRAME_BYTES, s_mic_listener_ctx);
 
             if (!s_input_session_active) {
                 /* Keep CPU1's idle task schedulable even during continuous capture. */
