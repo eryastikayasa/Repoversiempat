@@ -50,7 +50,7 @@ jobs:
           grep -n 'esp_srmodel_exists' main/main.cpp
           grep -n 'esp_wn_handle_from_name(WAKE_MODEL_NAME)' main/main.cpp
           grep -n 'wake_iface->create(WAKE_MODEL_NAME, DET_MODE_90)' main/main.cpp
-          grep -n 'wake_iface->detect(wake_model, wake_pcm)' main/main.cpp
+          grep -n 'wake_iface->detect(wake_model, wake_buffer)' main/main.cpp
           grep -n 'WAKE WORD TERDETEKSI: HI, ESP' main/main.cpp
           echo "--- model partition ---"
           grep -E '^model,.*0x400000' partitions/partitions.csv
