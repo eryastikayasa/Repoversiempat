@@ -2,11 +2,14 @@
 
 #include <math.h>
 #include <string.h>
+#include "esp_timer.h"
 
 namespace {
 
 static uint8_t s_face_buffer[DISPLAY_FACE_BUFFER_SIZE] = {0};
 static face_state_t s_current_face_state = FACE_IDLE;
+static face_state_t s_previous_face_state = FACE_IDLE;
+static esp_timer_handle_t s_face_override_timer = nullptr;
 
 // -----------------------------------------------------------------------------
 // Low-level framebuffer drawing
@@ -87,10 +90,8 @@ static void draw_open_eye(int cx, int cy, int gaze_x, int gaze_y,
     const int pupil_x = eye_x + gaze_x;
     const int pupil_y = eye_y + gaze_y;
 
-    // White eye.
     fill_circle(eye_x, eye_y, EYE_RADIUS);
 
-    // Clear the pupil area to create the black pupil.
     for (int y = -PUPIL_RADIUS; y <= PUPIL_RADIUS; ++y) {
         const int q = PUPIL_RADIUS * PUPIL_RADIUS - y * y;
         const int dx = q > 0 ? (int)sqrtf((float)q) : 0;
@@ -100,7 +101,6 @@ static void draw_open_eye(int cx, int cy, int gaze_x, int gaze_y,
         }
     }
 
-    // Small white highlight.
     fill_circle(pupil_x - 2, pupil_y - 3, 3);
 }
 
@@ -254,13 +254,30 @@ static void render_current_face()
     }
 }
 
+static void face_override_expired(void *)
+{
+    s_current_face_state = s_previous_face_state;
+    render_current_face();
+}
+
 } // namespace
 
 void display_face_init(void)
 {
     s_current_face_state = FACE_IDLE;
+    s_previous_face_state = FACE_IDLE;
     memset(s_face_buffer, 0, sizeof(s_face_buffer));
     render_current_face();
+
+    if (!s_face_override_timer) {
+        const esp_timer_create_args_t args = {
+            .callback = &face_override_expired,
+            .arg = nullptr,
+            .dispatch_method = ESP_TIMER_TASK,
+            .name = "face_override"
+        };
+        esp_timer_create(&args, &s_face_override_timer);
+    }
 }
 
 void display_face_update(uint32_t now_ms)
@@ -275,8 +292,37 @@ void display_face_set_state(face_state_t state)
         state = FACE_IDLE;
     }
 
+    if (s_face_override_timer) {
+        esp_timer_stop(s_face_override_timer);
+    }
+
+    s_current_face_state = state;
+    s_previous_face_state = state;
+    render_current_face();
+}
+
+void display_face_show_for_ms(face_state_t state, uint32_t duration_ms)
+{
+    if (state < FACE_IDLE || state > FACE_SLEEP) {
+        state = FACE_IDLE;
+    }
+    if (duration_ms == 0) {
+        display_face_set_state(state);
+        return;
+    }
+
+    if (!s_face_override_timer) {
+        display_face_init();
+    }
+
+    if (esp_timer_is_active(s_face_override_timer)) {
+        esp_timer_stop(s_face_override_timer);
+    }
+
+    s_previous_face_state = s_current_face_state;
     s_current_face_state = state;
     render_current_face();
+    esp_timer_start_once(s_face_override_timer, (uint64_t)duration_ms * 1000ULL);
 }
 
 face_state_t display_face_get_state(void)
