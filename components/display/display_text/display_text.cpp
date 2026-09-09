@@ -10,6 +10,7 @@ namespace {
 
 constexpr int OLED_WIDTH = 128;
 constexpr int OLED_HEIGHT = 64;
+constexpr uint32_t TEXT_SCROLL_STEP_MS = 33;
 
 static EXT_RAM_BSS_ATTR uint8_t s_text_buffer[OLED_WIDTH * OLED_HEIGHT / 8] = {0};
 static char s_user_scroll_text[256] = {0};
@@ -17,6 +18,7 @@ static char s_gemini_scroll_text[256] = {0};
 static char s_status_text[64] = {0};
 static uint16_t s_user_scroll_offset = 0;
 static uint16_t s_gemini_scroll_offset = 0;
+static uint32_t s_last_update_ms = 0;
 static portMUX_TYPE s_scroll_text_mux = portMUX_INITIALIZER_UNLOCKED;
 
 static uint8_t text_glyph_row(char c, int row)
@@ -75,7 +77,7 @@ static void draw_text_char(int x, int y, char c)
     }
 }
 
-static void draw_scrolling_text(const char *text, uint16_t &offset, int text_x)
+static void draw_scrolling_text(const char *text, uint16_t offset, int text_x)
 {
     if (!text || !text[0]) return;
 
@@ -93,7 +95,6 @@ static void draw_scrolling_text(const char *text, uint16_t &offset, int text_x)
     if (text_px <= visible_width) {
         for (size_t i = 0; i < len; ++i)
             draw_text_char(text_x + (int)i * CHAR_WIDTH, TEXT_Y, text[i]);
-        offset = 0;
         return;
     }
 
@@ -110,8 +111,6 @@ static void draw_scrolling_text(const char *text, uint16_t &offset, int text_x)
         const int x = pos + (int)i * CHAR_WIDTH;
         if (x + 5 >= text_x && x <= TEXT_RIGHT) draw_text_char(x, TEXT_Y, text[i]);
     }
-
-    offset = (uint16_t)((offset + 1) % cycle_px);
 }
 
 static void set_scroll_text(char *dst, size_t dst_size, const char *text, uint16_t &offset)
@@ -195,17 +194,59 @@ static int draw_rssi(void)
     return x;
 }
 
+static uint16_t advance_scroll_offset(const char *text, uint16_t offset, uint32_t steps)
+{
+    if (!text || !text[0]) return 0;
+
+    constexpr uint16_t CHAR_WIDTH = 6;
+    constexpr uint16_t GAP_PX = 12;
+    const uint32_t text_px = (uint32_t)strlen(text) * CHAR_WIDTH;
+    const uint32_t visible_width = OLED_WIDTH - 1 - 4 + 1;
+    if (text_px <= visible_width) return 0;
+
+    const uint32_t cycle_px = text_px + GAP_PX;
+    return (uint16_t)((offset + steps) % cycle_px);
+}
+
 }
 
 void display_text_init(void)
 {
+    portENTER_CRITICAL(&s_scroll_text_mux);
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
+    s_user_scroll_text[0] = '\0';
+    s_gemini_scroll_text[0] = '\0';
     s_status_text[0] = '\0';
+    s_user_scroll_offset = 0;
+    s_gemini_scroll_offset = 0;
+    s_last_update_ms = 0;
+    portEXIT_CRITICAL(&s_scroll_text_mux);
 }
 
 void display_text_update(uint32_t now_ms)
 {
-    (void)now_ms;
+    portENTER_CRITICAL(&s_scroll_text_mux);
+
+    if (s_last_update_ms == 0) {
+        s_last_update_ms = now_ms;
+        portEXIT_CRITICAL(&s_scroll_text_mux);
+        return;
+    }
+
+    const uint32_t elapsed_ms = now_ms - s_last_update_ms;
+    const uint32_t steps = elapsed_ms / TEXT_SCROLL_STEP_MS;
+    if (steps == 0) {
+        portEXIT_CRITICAL(&s_scroll_text_mux);
+        return;
+    }
+
+    s_user_scroll_offset = advance_scroll_offset(
+        s_user_scroll_text, s_user_scroll_offset, steps);
+    s_gemini_scroll_offset = advance_scroll_offset(
+        s_gemini_scroll_text, s_gemini_scroll_offset, steps);
+
+    s_last_update_ms += steps * TEXT_SCROLL_STEP_MS;
+    portEXIT_CRITICAL(&s_scroll_text_mux);
 }
 
 void display_text_set_user(const char *text)
@@ -255,10 +296,6 @@ void display_text_render_user(void)
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
     const int rssi_end_x = draw_rssi();
     draw_scrolling_text(text, offset, rssi_end_x > 0 ? rssi_end_x + 4 : 4);
-
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    s_user_scroll_offset = offset;
-    portEXIT_CRITICAL(&s_scroll_text_mux);
 }
 
 void display_text_render_gemini(void)
@@ -273,10 +310,6 @@ void display_text_render_gemini(void)
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
     const int rssi_end_x = draw_rssi();
     draw_scrolling_text(text, offset, rssi_end_x > 0 ? rssi_end_x + 4 : 4);
-
-    portENTER_CRITICAL(&s_scroll_text_mux);
-    s_gemini_scroll_offset = offset;
-    portEXIT_CRITICAL(&s_scroll_text_mux);
 }
 
 void display_text_render_status(void)
