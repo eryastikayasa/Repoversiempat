@@ -1,5 +1,6 @@
 #include "websocket_internal.h"
 #include "display.h"
+#include "display_face.h"
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_websocket_client.h"
@@ -146,7 +147,7 @@ void websocket_event_handler(void *handler_args, esp_event_base_t base,
             is_connected = false;
             setup_complete = false;
             websocket_tx_error = true;
-            face_set_state(FACE_ERROR);
+            display_face_set_state(FACE_ERROR);
             display_status("AI Error!");
             invalidate_connection_generation();
             websocket_tx_flush_queue();
