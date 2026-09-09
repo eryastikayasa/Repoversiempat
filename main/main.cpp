@@ -287,21 +287,36 @@ extern "C" void app_main()
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
+    gpio_set_direction(BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);
+    gpio_set_pull_mode(BOOT_BUTTON_GPIO, GPIO_PULLUP_ONLY);
+    uart_control_init();
+
+    /* Network and NTP must be ready before WakeNet is created and before
+     * AudioEngine starts reading the microphone. This restores the known-good
+     * startup ordering used by the build that successfully detected HI, ESP. */
+    display_status("Menghubungkan WiFi...");
+    wifi_init_sta();
+    if (!wifi_wait_for_connection(15000)) {
+        ESP_LOGE(TAG, "Wi-Fi tidak mendapatkan IP.");
+        display_status("WiFi Gagal!");
+        face_set_state(FACE_ERROR);
+        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "WiFi power save dimatikan");
+    sync_sntp_time();
+
+    /* Only after WiFi/NTP are complete: initialize WakeNet, then start the
+     * AudioEngine capture path that feeds audio_read_mic() into WakeNet. */
     const bool wake_ready = wakeword_init();
     if (!wake_ready) {
         ESP_LOGE(TAG, "WakeNet init gagal. Sistem tetap bisa dimulai dengan tombol BOOT.");
         display_status("WakeNet gagal!");
     } else {
-        display_status("Katakan: Hi, ESP");
+        display_status("WakeNet siap. Katakan: Hi, ESP");
     }
 
-    gpio_set_direction(BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BOOT_BUTTON_GPIO, GPIO_PULLUP_ONLY);
-    uart_control_init();
-
-    /* Start mic capture before Wi-Fi/NTP so WakeNet listens immediately after boot.
-     * The transport sink is installed too, but AudioEngine keeps input_session_active
-     * false until a wake/button session starts, so no PCM is sent to WebSocket here. */
     audio_engine_set_mic_listener(wake_ready ? wakeword_frame_cb : nullptr, nullptr);
     audio_engine_set_mic_sink(
         [](const uint8_t *pcm, size_t len, void *ctx) {
@@ -318,20 +333,6 @@ extern "C" void app_main()
     }
 
     display_status("WakeNet mendengar...");
-
-    display_status("Menghubungkan WiFi...");
-    wifi_init_sta();
-    if (!wifi_wait_for_connection(15000)) {
-        ESP_LOGE(TAG, "Wi-Fi tidak mendapatkan IP.");
-        display_status("WiFi Gagal!");
-        face_set_state(FACE_ERROR);
-        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    ESP_LOGI(TAG, "WiFi power save dimatikan");
-    sync_sntp_time();
-
     face_set_state(FACE_SLEEP);
     display_status("Sistem siap. Katakan Hi, ESP...");
 
