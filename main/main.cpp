@@ -222,31 +222,6 @@ static void app_supervisor_task(void *arg)
     }
 }
 
-static bool resolve_host(const char *label, const char *host, const char *port)
-{
-    ESP_LOGI(TAG, "DNS [%s]: %s:%s", label, host, port);
-    struct addrinfo hints = {};
-    struct addrinfo *result = nullptr;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    const int err = getaddrinfo(host, port, &hints, &result);
-    if (err != 0 || !result) {
-        ESP_LOGE(TAG, "DNS [%s]: FAILED err=%d errno=%d", label, err, errno);
-        return false;
-    }
-    freeaddrinfo(result);
-    ESP_LOGI(TAG, "DNS [%s]: OK", label);
-    return true;
-}
-
-static void debug_network_path(void)
-{
-    const bool google_ok = resolve_host("google.com", "google.com", "443");
-    const bool gemini_ok = resolve_host("Gemini", "generativelanguage.googleapis.com", "443");
-    ESP_LOGI(TAG, "NETWORK BASIC: google=%s Gemini=%s",
-             google_ok ? "OK" : "FAILED", gemini_ok ? "OK" : "FAILED");
-}
-
 static void sync_sntp_time(void)
 {
     ESP_LOGI(TAG, "Mencari server NTP...");
@@ -304,7 +279,6 @@ extern "C" void app_main()
     display_status("Booting...");
 
     audio_hal_init();
-    audio_i2s_test_tone();
 
     if (!audio_engine_init()) {
         ESP_LOGE(TAG, "AudioEngine init gagal");
@@ -337,7 +311,6 @@ extern "C" void app_main()
     esp_wifi_set_ps(WIFI_PS_NONE);
     ESP_LOGI(TAG, "WiFi power save dimatikan");
     sync_sntp_time();
-    debug_network_path();
 
     audio_engine_set_mic_listener(wake_ready ? wakeword_frame_cb : nullptr, nullptr);
     audio_engine_set_mic_sink(
