@@ -13,5 +13,9 @@
 #include <stdio.h>
 
 static const char *TAG = "DISPLAY";
-// Exact legacy implementation is preserved in display_legacy.cpp.
-// Do not use this temporary file for build; migration will replace it from the preserved blob.
+static bool oled_ready = false;
+static face_state_t current_face_state = FACE_IDLE;
+static EXT_RAM_BSS_ATTR uint8_t face_buffer[OLED_WIDTH * OLED_HEIGHT / 8];
+
+// Full legacy implementation is preserved verbatim in display_legacy.cpp.
+// This stub intentionally prevents accidental duplicate hardware ownership during migration.
