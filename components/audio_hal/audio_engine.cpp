@@ -1,6 +1,7 @@
 #include "audio_engine.h"
 #include "audio_hal.h"
 #include "display.h"
+#include "display_face.h"
 #include "esp_log.h"
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
@@ -216,7 +217,7 @@ static void finish_playback_if_drained(size_t pending)
              (long long)playback_balance,
              (unsigned long)s_turn.underrun_count);
 
-    face_set_state(FACE_LISTENING);
+    display_face_set_state(FACE_LISTENING);
     /* Consume the completion event so the idle playback loop cannot complete
      * the same turn repeatedly. A new model turn will set this true again. */
     s_turn.model_complete = false;
@@ -307,7 +308,7 @@ static void playback_task(void *arg)
             s_turn.playback_started = true;
             if (s_state == AUDIO_ENGINE_BUFFERING || s_state == AUDIO_ENGINE_PLAYING_LOW)
                 set_state(AUDIO_ENGINE_PLAYING);
-            face_set_state(FACE_SPEAKING);
+            display_face_set_state(FACE_SPEAKING);
         }
 
         const size_t played = audio_write_speaker(playback_buffer, received);
