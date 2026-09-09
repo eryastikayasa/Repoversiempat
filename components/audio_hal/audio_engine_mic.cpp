@@ -103,7 +103,11 @@ static void capture_task(void *arg)
             if (s_mic_listener)
                 s_mic_listener(frame_buffer, MIC_FRAME_BYTES, s_mic_listener_ctx);
 
-            if (!s_input_session_active) continue;
+            if (!s_input_session_active) {
+                /* Keep CPU1's idle task schedulable even during continuous capture. */
+                vTaskDelay(1);
+                continue;
+            }
 
             if (frame_has_activity(frame_buffer, MIC_FRAME_BYTES))
                 s_last_activity_us = esp_timer_get_time();
@@ -114,6 +118,7 @@ static void capture_task(void *arg)
                 ESP_LOGI(TAG, "Input idle %ums: AudioEngine mengakhiri sesi MIC",
                          (unsigned)MIC_IDLE_TIMEOUT_MS);
                 s_input_session_active = false;
+                vTaskDelay(1);
                 continue;
             }
 
@@ -131,6 +136,10 @@ static void capture_task(void *arg)
                                  (unsigned)s_tx_queue_drops);
                 }
             }
+
+            /* One scheduler tick gives CPU1 IDLE a chance without moving any
+             * realtime audio work to another task. */
+            vTaskDelay(1);
         }
     }
 }
