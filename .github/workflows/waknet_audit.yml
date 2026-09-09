@@ -44,7 +44,7 @@ jobs:
           grep -E '^CONFIG_SPIRAM_MODE_OCT=y$' sdkconfig.defaults
           grep -E '^CONFIG_SPIRAM_SPEED_80M=y$' sdkconfig.defaults
           echo "--- source integration ---"
-          grep -n 'WAKE_MODEL_NAME "wn9_hiesp"' main/main.cpp
+          grep -n 'WAKE_MODEL_NAME\[\].*=.*"wn9_hiesp"' main/main.cpp
           grep -n 'static bool wakeword_init' main/main.cpp
           grep -n 'esp_srmodel_init("model")' main/main.cpp
           grep -n 'esp_srmodel_exists' main/main.cpp
