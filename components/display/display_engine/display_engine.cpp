@@ -11,15 +11,25 @@
 
 namespace {
 
+// One display frame every ~33 ms, matching the legacy visual update rate.
 constexpr int DISPLAY_ENGINE_FRAME_MS = 33;
-constexpr size_t DISPLAY_FRAMEBUFFER_SIZE = DISPLAY_FACE_BUFFER_SIZE;
+constexpr int DISPLAY_ENGINE_WIDTH = DISPLAY_DRIVER_WIDTH;
+constexpr int DISPLAY_ENGINE_HEIGHT = DISPLAY_DRIVER_HEIGHT;
+constexpr size_t DISPLAY_FRAMEBUFFER_SIZE =
+    (size_t)DISPLAY_ENGINE_WIDTH * (size_t)DISPLAY_ENGINE_HEIGHT / 8U;
 
+// The Engine owns exactly one final framebuffer in PSRAM.
 static EXT_RAM_BSS_ATTR uint8_t s_final_buffer[DISPLAY_FRAMEBUFFER_SIZE] = {0};
 static TaskHandle_t s_display_engine_task = nullptr;
 static bool s_initialized = false;
 static volatile bool s_running = false;
 
-static void overlay_text(void)
+static void clear_final_frame(void)
+{
+    memset(s_final_buffer, 0, sizeof(s_final_buffer));
+}
+
+static void overlay_text_buffer(void)
 {
     const uint8_t *text = display_text_buffer();
     if (!text) return;
@@ -29,29 +39,42 @@ static void overlay_text(void)
     }
 }
 
+// Select which already-defined Text presentation is active. The Engine does
+// not draw glyphs or manage scroll state; those responsibilities stay inside
+// the Text engine.
+static void update_text_layer(void)
+{
+    switch (display_face_get_state()) {
+        case FACE_LISTENING:
+            display_text_render_user();
+            break;
+
+        case FACE_SPEAKING:
+            display_text_render_gemini();
+            break;
+
+        default:
+            display_text_render_status();
+            break;
+    }
+}
+
+// Pure software composition:
+//   Face framebuffer + Text framebuffer -> final framebuffer.
+// No I2C, SSD1306 access, glyph drawing, or animation logic lives here.
 static void compose_frame(void)
 {
     const uint8_t *face = display_face_buffer();
-    if (!face) {
-        memset(s_final_buffer, 0, sizeof(s_final_buffer));
-        return;
+    const uint8_t *text = display_text_buffer();
+
+    clear_final_frame();
+
+    if (face) {
+        memcpy(s_final_buffer, face, sizeof(s_final_buffer));
     }
 
-    // Legacy layout: Face remains the full 128x64 base framebuffer.
-    memcpy(s_final_buffer, face, sizeof(s_final_buffer));
-
-    // Legacy ordering: RSSI + conversation/status text are overlays on top
-    // of the face, never a separate fixed-height panel.
-    const face_state_t state = display_face_get_state();
-    if (state == FACE_LISTENING) {
-        display_text_render_user();
-        overlay_text();
-    } else if (state == FACE_SPEAKING) {
-        display_text_render_gemini();
-        overlay_text();
-    } else {
-        display_text_render_status();
-        overlay_text();
+    if (text) {
+        overlay_text_buffer();
     }
 }
 
@@ -62,13 +85,21 @@ static void display_engine_task(void *)
     while (s_running) {
         const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
 
+        // 1. Advance the independent visual engines.
         display_face_update(now_ms);
         display_text_update(now_ms);
+
+        // 2. Ask Text to prepare its own framebuffer for this frame.
+        update_text_layer();
+
+        // 3. Compose Face + Text into the single final framebuffer.
         compose_frame();
+
+        // 4. Single presentation path. The Driver alone owns I2C/SSD1306.
         display_driver_present(
             s_final_buffer,
-            DISPLAY_FACE_WIDTH,
-            DISPLAY_FACE_HEIGHT
+            DISPLAY_ENGINE_WIDTH,
+            DISPLAY_ENGINE_HEIGHT
         );
 
         vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(DISPLAY_ENGINE_FRAME_MS));
@@ -84,7 +115,7 @@ void display_engine_init(void)
 {
     if (s_initialized) return;
 
-    memset(s_final_buffer, 0, sizeof(s_final_buffer));
+    clear_final_frame();
     display_driver_init();
     s_initialized = true;
 }
