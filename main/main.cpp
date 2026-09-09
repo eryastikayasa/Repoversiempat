@@ -299,19 +299,9 @@ extern "C" void app_main()
     gpio_set_pull_mode(BOOT_BUTTON_GPIO, GPIO_PULLUP_ONLY);
     uart_control_init();
 
-    display_status("Menghubungkan WiFi...");
-    wifi_init_sta();
-    if (!wifi_wait_for_connection(15000)) {
-        ESP_LOGE(TAG, "Wi-Fi tidak mendapatkan IP.");
-        display_status("WiFi Gagal!");
-        face_set_state(FACE_ERROR);
-        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    ESP_LOGI(TAG, "WiFi power save dimatikan");
-    sync_sntp_time();
-
+    /* Start mic capture before Wi-Fi/NTP so WakeNet listens immediately after boot.
+     * The transport sink is installed too, but AudioEngine keeps input_session_active
+     * false until a wake/button session starts, so no PCM is sent to WebSocket here. */
     audio_engine_set_mic_listener(wake_ready ? wakeword_frame_cb : nullptr, nullptr);
     audio_engine_set_mic_sink(
         [](const uint8_t *pcm, size_t len, void *ctx) {
@@ -326,6 +316,21 @@ extern "C" void app_main()
         face_set_state(FACE_ERROR);
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
+
+    display_status("WakeNet mendengar...");
+
+    display_status("Menghubungkan WiFi...");
+    wifi_init_sta();
+    if (!wifi_wait_for_connection(15000)) {
+        ESP_LOGE(TAG, "Wi-Fi tidak mendapatkan IP.");
+        display_status("WiFi Gagal!");
+        face_set_state(FACE_ERROR);
+        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    ESP_LOGI(TAG, "WiFi power save dimatikan");
+    sync_sntp_time();
 
     face_set_state(FACE_SLEEP);
     display_status("Sistem siap. Katakan Hi, ESP...");
