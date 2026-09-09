@@ -3,10 +3,11 @@
 #include <math.h>
 #include <string.h>
 #include "esp_timer.h"
+#include "esp_attr.h"
 
 namespace {
 
-static uint8_t s_face_buffer[DISPLAY_FACE_BUFFER_SIZE] = {0};
+static EXT_RAM_BSS_ATTR uint8_t s_face_buffer[DISPLAY_FACE_BUFFER_SIZE] = {0};
 static face_state_t s_current_face_state = FACE_IDLE;
 static face_state_t s_previous_face_state = FACE_IDLE;
 static esp_timer_handle_t s_face_override_timer = nullptr;
@@ -47,7 +48,7 @@ static void line(int x0, int y0, int x1, int y1)
 {
     const int dx = x1 > x0 ? x1 - x0 : x0 - x1;
     const int sx = x0 < x1 ? 1 : -1;
-    const int dy = y1 > y0 ? y0 - y1 : y1 - y0;
+    const int dy = y0 > y1 ? y0 - y1 : y1 - y0;
     const int sy = y0 < y1 ? 1 : -1;
     int err = dx + dy;
 
