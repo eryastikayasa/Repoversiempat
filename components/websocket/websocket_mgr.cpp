@@ -96,7 +96,7 @@ static void websocket_tx_task(void *arg)
                 int ret = mbedtls_base64_encode((unsigned char *)b64_buf, sizeof(b64_buf) - 1, &encoded_len, audio_data + offset, chunk_len);
                 if (ret != 0) { ESP_LOGW(TAG, "TX audio base64 gagal: ret=%d chunk=%u", ret, (unsigned)chunk_len); send_failed = true; break; }
                 b64_buf[encoded_len] = '\0';
-                int json_len = snprintf(json_buf, sizeof(json_buf), "{\"realtimeInput\":{\"mediaChunks\":[{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}]}}", b64_buf);
+                int json_len = snprintf(json_buf, sizeof(json_buf), "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}", b64_buf);
                 if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) { send_failed = true; break; }
                 bool sent_ok = false;
                 for (int retry = 0; retry <= AUDIO_SEND_RETRIES; ++retry) {
