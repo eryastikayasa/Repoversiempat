@@ -13,6 +13,7 @@ constexpr int OLED_HEIGHT = 64;
 static uint8_t s_text_buffer[OLED_WIDTH * OLED_HEIGHT / 8] = {0};
 static char s_user_scroll_text[256] = {0};
 static char s_gemini_scroll_text[256] = {0};
+static char s_status_text[64] = {0};
 static uint16_t s_user_scroll_offset = 0;
 static uint16_t s_gemini_scroll_offset = 0;
 static portMUX_TYPE s_scroll_text_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -198,6 +199,7 @@ static int draw_rssi(void)
 void display_text_init(void)
 {
     memset(s_text_buffer, 0, sizeof(s_text_buffer));
+    s_status_text[0] = '\0';
 }
 
 void display_text_update(uint32_t now_ms)
@@ -230,6 +232,13 @@ void display_text_append_gemini(const char *text)
 {
     portENTER_CRITICAL(&s_scroll_text_mux);
     append_scroll_text(s_gemini_scroll_text, sizeof(s_gemini_scroll_text), text);
+    portEXIT_CRITICAL(&s_scroll_text_mux);
+}
+
+void display_text_set_status(const char *text)
+{
+    portENTER_CRITICAL(&s_scroll_text_mux);
+    set_scroll_text(s_status_text, sizeof(s_status_text), text, s_user_scroll_offset);
     portEXIT_CRITICAL(&s_scroll_text_mux);
 }
 
@@ -267,6 +276,29 @@ void display_text_render_gemini(void)
     portENTER_CRITICAL(&s_scroll_text_mux);
     s_gemini_scroll_offset = offset;
     portEXIT_CRITICAL(&s_scroll_text_mux);
+}
+
+void display_text_render_status(void)
+{
+    char text[64] = {0};
+    portENTER_CRITICAL(&s_scroll_text_mux);
+    strncpy(text, s_status_text, sizeof(text) - 1);
+    portEXIT_CRITICAL(&s_scroll_text_mux);
+
+    memset(s_text_buffer, 0, sizeof(s_text_buffer));
+
+    constexpr int CHAR_WIDTH = 6;
+    constexpr int TEXT_Y = OLED_HEIGHT - 5;
+    const size_t len = strlen(text);
+    const int max_chars = OLED_WIDTH / CHAR_WIDTH;
+    const int chars_to_draw = len < (size_t)max_chars ? (int)len : max_chars;
+
+    int x = (OLED_WIDTH - chars_to_draw * CHAR_WIDTH) / 2;
+    if (x < 0) x = 0;
+
+    for (int i = 0; i < chars_to_draw; ++i) {
+        draw_text_char(x + i * CHAR_WIDTH, TEXT_Y, text[i]);
+    }
 }
 
 const uint8_t *display_text_buffer(void)
