@@ -1,4 +1,5 @@
 #include "display_face.h"
+#include "display_text.h"
 #include "wifi_manager.h"
 #include "websocket_mgr.h"
 #include "audio_hal.h"
@@ -225,7 +226,7 @@ static void app_supervisor_task(void *arg)
 static void sync_sntp_time(void)
 {
     ESP_LOGI(TAG, "Mencari server NTP...");
-    display_status("Sync Jam Network..");
+    display_text_set_status("Sync Jam Network..");
     esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "time.google.com");
     esp_sntp_setservername(1, "id.pool.ntp.org");
@@ -240,7 +241,7 @@ static void sync_sntp_time(void)
         localtime_r(&now, &timeinfo);
         if (timeinfo.tm_year >= (2024 - 1900)) {
             ESP_LOGI(TAG, "Waktu cocok! Tahun: %d", timeinfo.tm_year + 1900);
-            display_status("Jam Cocok!");
+            display_text_set_status("Jam Cocok!");
             vTaskDelay(pdMS_TO_TICKS(1000));
             return;
         }
@@ -250,7 +251,7 @@ static void sync_sntp_time(void)
     ESP_LOGW(TAG, "NTP gagal. Menggunakan waktu fallback.");
     struct timeval tv = { .tv_sec = 1770000000, .tv_usec = 0 };
     settimeofday(&tv, NULL);
-    display_status("Jam Set Fallback");
+    display_text_set_status("Jam Set Fallback");
 }
 
 extern "C" void app_main()
@@ -268,19 +269,20 @@ extern "C" void app_main()
     ESP_ERROR_CHECK(ret);
 
     if (web_config_is_needed()) {
-        display_status("Config Mode");
+        display_text_set_status("Config Mode");
         web_config_start();
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
     display_face_init();
+    display_text_init();
     display_face_set_state(FACE_SLEEP);
-    display_status("Booting...");
+    display_text_set_status("Booting...");
 
     audio_hal_init();
     if (!audio_engine_init()) {
         ESP_LOGE(TAG, "AudioEngine init gagal");
-        display_status("Audio Engine Gagal!");
+        display_text_set_status("Audio Engine Gagal!");
         display_face_set_state(FACE_ERROR);
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -289,11 +291,11 @@ extern "C" void app_main()
     gpio_set_pull_mode(BOOT_BUTTON_GPIO, GPIO_PULLUP_ONLY);
     uart_control_init();
 
-    display_status("Menghubungkan WiFi...");
+    display_text_set_status("Menghubungkan WiFi...");
     wifi_init_sta();
     if (!wifi_wait_for_connection(15000)) {
         ESP_LOGE(TAG, "Wi-Fi tidak mendapatkan IP.");
-        display_status("WiFi Gagal!");
+        display_text_set_status("WiFi Gagal!");
         display_face_set_state(FACE_ERROR);
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
@@ -305,9 +307,9 @@ extern "C" void app_main()
     const bool wake_ready = wakeword_init();
     if (!wake_ready) {
         ESP_LOGE(TAG, "WakeNet init gagal. Sistem tetap bisa dimulai dengan tombol BOOT.");
-        display_status("WakeNet gagal!");
+        display_text_set_status("WakeNet gagal!");
     } else {
-        display_status("WakeNet siap. Katakan: Hi, ESP");
+        display_text_set_status("WakeNet siap. Katakan: Hi, ESP");
     }
 
     audio_engine_set_mic_listener(wake_ready ? wakeword_frame_cb : nullptr, nullptr);
@@ -320,14 +322,14 @@ extern "C" void app_main()
 
     if (!audio_engine_start_capture()) {
         ESP_LOGE(TAG, "AudioEngine capture gagal");
-        display_status("Mic Engine Gagal!");
+        display_text_set_status("Mic Engine Gagal!");
         display_face_set_state(FACE_ERROR);
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    display_status("WakeNet mendengar...");
+    display_text_set_status("WakeNet mendengar...");
     display_face_set_state(FACE_SLEEP);
-    display_status("Sistem siap. Katakan Hi, ESP...");
+    display_text_set_status("Sistem siap. Katakan Hi, ESP...");
 
     BaseType_t task_result = xTaskCreate(
         app_supervisor_task, "app_supervisor", 6144, nullptr, 5, nullptr);
