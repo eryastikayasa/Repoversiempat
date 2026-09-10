@@ -89,30 +89,24 @@ static void draw_happy_eye(int cx, int cy)
 
 static void draw_normal_brow(int cx, int cy)
 {
-    line(cx - 12, cy + 1, cx - 6, cy - 4);
-    line(cx - 12, cy + 2, cx - 6, cy - 3);
-    line(cx - 6, cy - 4, cx + 6, cy - 4);
-    line(cx - 6, cy - 3, cx + 6, cy - 3);
-    line(cx + 6, cy - 4, cx + 12, cy + 1);
-    line(cx + 6, cy - 3, cx + 12, cy + 2);
+    // Smooth 2px arch: higher at the center, rounded toward both ends.
+    for (int x = -12; x <= 12; ++x) {
+        const float t = (float)x / 12.0f;
+        const int y = cy - 4 + (int)lroundf(5.0f * t * t);
+        pixel(cx + x, y);
+        pixel(cx + x, y + 1);
+    }
 }
 
 static void draw_sad_brow(int cx, int cy, bool left_eye)
 {
-    if (left_eye) {
-        line(cx - 12, cy - 2, cx - 6, cy + 1);
-        line(cx - 12, cy - 1, cx - 6, cy + 2);
-        line(cx - 6, cy + 1, cx + 6, cy + 6);
-        line(cx - 6, cy + 2, cx + 6, cy + 7);
-        line(cx + 6, cy + 6, cx + 12, cy + 8);
-        line(cx + 6, cy + 7, cx + 12, cy + 9);
-    } else {
-        line(cx - 12, cy + 8, cx - 6, cy + 6);
-        line(cx - 12, cy + 9, cx - 6, cy + 7);
-        line(cx - 6, cy + 6, cx + 6, cy + 1);
-        line(cx - 6, cy + 7, cx + 6, cy + 2);
-        line(cx + 6, cy + 1, cx + 12, cy - 2);
-        line(cx + 6, cy + 2, cx + 12, cy - 1);
+    // Smooth 2px diagonal, sloping downward toward the center of the face.
+    for (int x = -12; x <= 12; ++x) {
+        const float t = (float)(x + 12) / 24.0f;
+        const float slope = left_eye ? t : (1.0f - t);
+        const int y = cy - 2 + (int)lroundf(7.0f * slope);
+        pixel(cx + x, y);
+        pixel(cx + x, y + 1);
     }
 }
 
@@ -126,15 +120,19 @@ static void draw_sad_eye(int cx, int cy, int gaze_y)
 
 static void draw_sleep_eye(int cx, int cy)
 {
+    // Exactly 2px thick horizontal closed eye.
     line(cx - 12, cy, cx + 12, cy);
-    line(cx - 9, cy + 1, cx + 9, cy + 1);
+    line(cx - 12, cy + 1, cx + 12, cy + 1);
 }
 
 static void draw_error_eye(int cx, int cy)
 {
+    // 2px thick X, using two adjacent raster lines for each diagonal.
     constexpr int SIZE = 10;
     line(cx - SIZE, cy - SIZE, cx + SIZE, cy + SIZE);
+    line(cx - SIZE + 1, cy - SIZE, cx + SIZE + 1, cy + SIZE);
     line(cx + SIZE, cy - SIZE, cx - SIZE, cy + SIZE);
+    line(cx + SIZE - 1, cy - SIZE, cx - SIZE - 1, cy + SIZE);
 }
 
 static void render_mochi_gaze(int expr, int step,
