@@ -73,6 +73,14 @@ void websocket_send_audio_data(
         return;
     }
 
+    /* Half-duplex transport: AudioEngine owns the turn state. While Gemini
+     * audio is buffering/playing, do not feed the same WebSocket with MIC
+     * frames. This prevents uplink contention during model playback without
+     * moving audio policy into the WebSocket layer. */
+    if (audio_engine_turn_active()) {
+        return;
+    }
+
     uint32_t generation =
         websocket_connection_generation;
 
