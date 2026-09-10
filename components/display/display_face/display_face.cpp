@@ -87,11 +87,32 @@ static void draw_happy_eye(int cx, int cy)
     }
 }
 
-static void draw_sad_eye(int cx, int cy)
+static void draw_normal_brow(int cx, int cy)
 {
-    line(cx - 11, cy, cx - 5, cy + 2);
-    line(cx - 5, cy + 2, cx + 5, cy + 2);
-    line(cx + 5, cy + 2, cx + 11, cy);
+    line(cx - 12, cy + 1, cx - 6, cy - 4);
+    line(cx - 6, cy - 4, cx + 6, cy - 4);
+    line(cx + 6, cy - 4, cx + 12, cy + 1);
+}
+
+static void draw_sad_brow(int cx, int cy, bool left_eye)
+{
+    if (left_eye) {
+        line(cx - 12, cy - 2, cx - 6, cy + 1);
+        line(cx - 6, cy + 1, cx + 6, cy + 6);
+        line(cx + 6, cy + 6, cx + 12, cy + 8);
+    } else {
+        line(cx - 12, cy + 8, cx - 6, cy + 6);
+        line(cx - 6, cy + 6, cx + 6, cy + 1);
+        line(cx + 6, cy + 1, cx + 12, cy - 2);
+    }
+}
+
+static void draw_sad_eye(int cx, int cy, int gaze_y)
+{
+    const int y = cy + gaze_y;
+    line(cx - 11, y, cx - 5, y + 2);
+    line(cx - 5, y + 2, cx + 5, y + 2);
+    line(cx + 5, y + 2, cx + 11, y);
 }
 
 static void draw_sleep_eye(int cx, int cy)
@@ -117,6 +138,16 @@ static void render_mochi_gaze(int expr, int step,
     const int right_x = 94 + sX;
     const int eye_y = 28 + sY;
 
+    if (expr != 99) {
+        if (expr == 6) {
+            draw_sad_brow(left_x + eye_shift_x, 14 + sY, true);
+            draw_sad_brow(right_x + eye_shift_x, 14 + sY, false);
+        } else {
+            draw_normal_brow(left_x + eye_shift_x, 14 + sY);
+            draw_normal_brow(right_x + eye_shift_x, 14 + sY);
+        }
+    }
+
     if (step == 3) {
         draw_sleep_eye(left_x + eye_shift_x, eye_y + eye_shift_y);
         draw_sleep_eye(right_x + eye_shift_x, eye_y + eye_shift_y);
@@ -128,8 +159,8 @@ static void render_mochi_gaze(int expr, int step,
         return;
     }
     if (expr == 6) {
-        draw_sad_eye(left_x + eye_shift_x, eye_y + eye_shift_y);
-        draw_sad_eye(right_x + eye_shift_x, eye_y + eye_shift_y);
+        draw_sad_eye(left_x + eye_shift_x, eye_y + eye_shift_y, gaze_y);
+        draw_sad_eye(right_x + eye_shift_x, eye_y + eye_shift_y, gaze_y);
         return;
     }
     if (expr == 99) {
