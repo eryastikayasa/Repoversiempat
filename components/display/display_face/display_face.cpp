@@ -87,26 +87,38 @@ static void draw_happy_eye(int cx, int cy)
     }
 }
 
+// Smooth-looking 2px brow: two nearby pixel curves instead of a hard 2px block.
 static void draw_normal_brow(int cx, int cy)
 {
-    // Smooth 2px arch: higher at the center, rounded toward both ends.
-    for (int x = -12; x <= 12; ++x) {
-        const float t = (float)x / 12.0f;
-        const int y = cy - 4 + (int)lroundf(5.0f * t * t);
-        pixel(cx + x, y);
-        pixel(cx + x, y + 1);
+    static const int pts[][2] = {
+        {-13,  2}, {-12,  1}, {-11,  0}, {-10, -1}, {-9, -2}, {-8, -3},
+        {-7, -4}, {-5, -5}, {-3, -5}, {0, -5}, {3, -5}, {5, -5},
+        {7, -4}, {8, -3}, {9, -2}, {10, -1}, {11, 0}, {12, 1}, {13, 2}
+    };
+    for (size_t i = 0; i < sizeof(pts) / sizeof(pts[0]); ++i) {
+        pixel(cx + pts[i][0], cy + pts[i][1]);
+        pixel(cx + pts[i][0], cy + pts[i][1] + 1);
     }
 }
 
 static void draw_sad_brow(int cx, int cy, bool left_eye)
 {
-    // Smooth 2px diagonal, sloping downward toward the center of the face.
-    for (int x = -12; x <= 12; ++x) {
-        const float t = (float)(x + 12) / 24.0f;
-        const float slope = left_eye ? t : (1.0f - t);
-        const int y = cy - 2 + (int)lroundf(7.0f * slope);
-        pixel(cx + x, y);
-        pixel(cx + x, y + 1);
+    // Two-pixel smooth descending/ascending curve for a sad expression.
+    static const int left_pts[][2] = {
+        {-13, -1}, {-12, 0}, {-11, 0}, {-10, 1}, {-9, 1}, {-8, 2},
+        {-7, 2}, {-6, 3}, {-4, 4}, {-2, 5}, {0, 5}, {2, 6}, {4, 6},
+        {6, 7}, {8, 7}, {10, 8}, {12, 8}, {13, 9}
+    };
+    static const int right_pts[][2] = {
+        {-13, 9}, {-12, 8}, {-10, 8}, {-8, 7}, {-6, 7}, {-4, 6},
+        {-2, 6}, {0, 5}, {2, 5}, {4, 4}, {6, 3}, {7, 2}, {8, 2},
+        {9, 1}, {10, 1}, {11, 0}, {12, 0}, {13, -1}
+    };
+    const auto &pts = left_eye ? left_pts : right_pts;
+    constexpr size_t count = sizeof(left_pts) / sizeof(left_pts[0]);
+    for (size_t i = 0; i < count; ++i) {
+        pixel(cx + pts[i][0], cy + pts[i][1]);
+        pixel(cx + pts[i][0], cy + pts[i][1] + 1);
     }
 }
 
@@ -120,19 +132,23 @@ static void draw_sad_eye(int cx, int cy, int gaze_y)
 
 static void draw_sleep_eye(int cx, int cy)
 {
-    // Exactly 2px thick horizontal closed eye.
-    line(cx - 12, cy, cx + 12, cy);
-    line(cx - 12, cy + 1, cx + 12, cy + 1);
+    // Solid 2px horizontal eyelid.
+    for (int x = cx - 12; x <= cx + 12; ++x) {
+        pixel(x, cy);
+        pixel(x, cy + 1);
+    }
 }
 
 static void draw_error_eye(int cx, int cy)
 {
-    // 2px thick X, using two adjacent raster lines for each diagonal.
+    // 2px diagonals: each diagonal is drawn twice with a one-pixel offset.
     constexpr int SIZE = 10;
-    line(cx - SIZE, cy - SIZE, cx + SIZE, cy + SIZE);
-    line(cx - SIZE + 1, cy - SIZE, cx + SIZE + 1, cy + SIZE);
-    line(cx + SIZE, cy - SIZE, cx - SIZE, cy + SIZE);
-    line(cx + SIZE - 1, cy - SIZE, cx - SIZE - 1, cy + SIZE);
+    for (int i = -SIZE; i <= SIZE; ++i) {
+        pixel(cx + i, cy + i);
+        pixel(cx + i, cy + i + 1);
+        pixel(cx + i, cy - i);
+        pixel(cx + i, cy - i + 1);
+    }
 }
 
 static void render_mochi_gaze(int expr, int step,
