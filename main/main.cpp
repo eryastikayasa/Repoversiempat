@@ -155,7 +155,6 @@ static void start_assistant_session(void)
     wake_requested = false;
     reconnect_attempts = 0;
     connect_start_us = esp_timer_get_time();
-    audio_engine_start_input_session();
     display_face_set_state(FACE_HAPPY);
     websocket_app_start();
 }
@@ -183,6 +182,36 @@ static void app_supervisor_task(void *arg)
                 }
             }
             vTaskDelay(pdMS_TO_TICKS(20));
+            continue;
+        }
+
+        /* WebSocket/Gemini must be fully ready before AudioEngine opens the
+         * live MIC input session. This keeps session timing owned by the
+         * supervisor instead of starting the 60-second audio idle timer early. */
+        if (!audio_engine_input_session_active()) {
+            if (websocket_is_connected()) {
+                ESP_LOGI(TAG, "Gemini siap. Memulai sesi input AudioEngine...");
+                audio_engine_start_input_session();
+            } else {
+                if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) {
+                    if (reconnect_attempts < 5) {
+                        const int delay_sec = 2 << reconnect_attempts;
+                        ++reconnect_attempts;
+                        ESP_LOGW(TAG, "Reconnect attempt %d in %d sec...",
+                                 reconnect_attempts, delay_sec);
+                        vTaskDelay(pdMS_TO_TICKS(delay_sec * 1000));
+                        websocket_app_start();
+                        connect_start_us = esp_timer_get_time();
+                    } else {
+                        ESP_LOGW(TAG, "Reconnect gagal, kembali ke mode sleep.");
+                        assistant_active = false;
+                        display_face_set_state(FACE_SLEEP);
+                        reconnect_attempts = 0;
+                    }
+                } else {
+                    vTaskDelay(pdMS_TO_TICKS(100));
+                }
+            }
             continue;
         }
 
