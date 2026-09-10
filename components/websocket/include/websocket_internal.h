@@ -19,7 +19,9 @@
 #define WS_RX_STREAM_THRESHOLD (8 * 1024)
 #define WS_RX_STREAM_COMPACT_SIZE (8 * 1024)
 #define WS_TX_AUDIO_SIZE 3200
-#define WS_TX_QUEUE_LENGTH 3
+/* AudioEngine produces 20ms/320B frames. Keep enough headroom for
+ * short TLS/WebSocket stalls while the TX worker aggregates frames. */
+#define WS_TX_QUEUE_LENGTH 10
 #define WS_RX_QUEUE_LENGTH WS_RX_SLOT_COUNT
 
 typedef enum { WS_TX_COMMAND_SETUP = 1, WS_TX_COMMAND_AUDIO = 2 } ws_tx_command_type_t;
