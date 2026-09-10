@@ -90,20 +90,29 @@ static void draw_happy_eye(int cx, int cy)
 static void draw_normal_brow(int cx, int cy)
 {
     line(cx - 12, cy + 1, cx - 6, cy - 4);
+    line(cx - 12, cy + 2, cx - 6, cy - 3);
     line(cx - 6, cy - 4, cx + 6, cy - 4);
+    line(cx - 6, cy - 3, cx + 6, cy - 3);
     line(cx + 6, cy - 4, cx + 12, cy + 1);
+    line(cx + 6, cy - 3, cx + 12, cy + 2);
 }
 
 static void draw_sad_brow(int cx, int cy, bool left_eye)
 {
     if (left_eye) {
         line(cx - 12, cy - 2, cx - 6, cy + 1);
+        line(cx - 12, cy - 1, cx - 6, cy + 2);
         line(cx - 6, cy + 1, cx + 6, cy + 6);
+        line(cx - 6, cy + 2, cx + 6, cy + 7);
         line(cx + 6, cy + 6, cx + 12, cy + 8);
+        line(cx + 6, cy + 7, cx + 12, cy + 9);
     } else {
         line(cx - 12, cy + 8, cx - 6, cy + 6);
+        line(cx - 12, cy + 9, cx - 6, cy + 7);
         line(cx - 6, cy + 6, cx + 6, cy + 1);
+        line(cx - 6, cy + 7, cx + 6, cy + 2);
         line(cx + 6, cy + 1, cx + 12, cy - 2);
+        line(cx + 6, cy + 2, cx + 12, cy - 1);
     }
 }
 
@@ -176,11 +185,6 @@ static void render_mochi_gaze(int expr, int step,
     draw_open_eye(left_x, eye_y, gaze_x, gaze_y, eye_shift_x, eye_shift_y);
     draw_open_eye(right_x, eye_y, gaze_x, gaze_y, eye_shift_x, eye_shift_y);
 }
-
-// -----------------------------------------------------------------------------
-// Face personality engine. All animation decisions live here.
-// OLED Engine only calls display_face_update().
-// -----------------------------------------------------------------------------
 
 static uint32_t elapsed_ms(uint32_t now_ms)
 {
