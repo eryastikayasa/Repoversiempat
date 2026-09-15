@@ -203,6 +203,7 @@ void websocket_end_session(void)
     websocket_tx_error = false;
     websocket_connection_generation = websocket_connection_generation + 1;
     websocket_tx_flush_queue();
+    clear_session_handle();
     ESP_LOGI(TAG, "WS: Gemini session dihentikan sengaja; kembali menunggu Wake Word");
     if (client != NULL)
         (void)esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
