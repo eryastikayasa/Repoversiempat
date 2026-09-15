@@ -27,6 +27,21 @@ QueueHandle_t websocket_tx_queue = NULL;
 TaskHandle_t websocket_tx_task_handle = NULL;
 static TaskHandle_t websocket_cleanup_task_handle = NULL;
 
+static void repo3_normalize_gemini_setup(char *json, size_t *len)
+{
+    if (!json || !len || *len == 0) return;
+    /* Repo4's AudioEngine/UI setup builder adds explicit AAD sensitivity
+     * fields. Repo3's known-good wire setup leaves only disabled=false.
+     * Remove those optional fields at the transport boundary so Gemini sees
+     * the same AAD configuration as the reference implementation. */
+    const char *needle = ",\"startOfSpeechSensitivity\":\"START_SENSITIVITY_HIGH\",\"prefixPaddingMs\":40,\"endOfSpeechSensitivity\":\"END_SENSITIVITY_HIGH\",\"silenceDurationMs\":500";
+    char *p = strstr(json, needle);
+    if (!p) return;
+    size_t n = strlen(needle);
+    memmove(p, p + n, *len - (size_t)(p - json) - n + 1);
+    *len -= n;
+}
+
 void websocket_tx_flush_queue(void)
 {
     if (!websocket_tx_queue) return;
@@ -41,9 +56,6 @@ void websocket_tx_flush_queue(void)
 
 static void websocket_tx_fail(void)
 {
-    /* Match Repo3: a failed write invalidates the current generation and
-     * stops producers, but does not recursively close the WebSocket from the
-     * TX worker. The normal lifecycle path owns close/destroy. */
     websocket_tx_error = true;
     is_connected = false;
     setup_complete = false;
@@ -110,6 +122,7 @@ static void websocket_tx_task(void *arg)
                 free(audio_data);
                 continue;
             }
+            repo3_normalize_gemini_setup(setup_json, &setup_len);
 
             if (cmd.generation != websocket_connection_generation ||
                 !is_connected || websocket_tx_error || client != ws ||
@@ -266,9 +279,6 @@ bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t genera
     cmd.data = copy;
 
     if (xQueueSend(websocket_tx_queue, &cmd, 0) != pdTRUE) {
-        /* Match Repo3: discard the oldest queued audio command, then admit
-         * the newest frame. This keeps the realtime stream moving rather than
-         * letting producer backpressure accumulate indefinitely. */
         ws_tx_command_t stale = {};
         if (xQueueReceive(websocket_tx_queue, &stale, 0) == pdTRUE && stale.data)
             free(stale.data);
