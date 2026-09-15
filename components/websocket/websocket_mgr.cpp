@@ -23,6 +23,7 @@ volatile uint32_t websocket_connection_generation = 0;
 char session_handle[SESSION_HANDLE_MAX_LEN] = {0};
 bool session_resumable = false;
 static volatile bool ws_started = false;
+static volatile bool intentional_standby = false;
 QueueHandle_t websocket_tx_queue = NULL;
 TaskHandle_t websocket_tx_task_handle = NULL;
 static TaskHandle_t websocket_cleanup_task_handle = NULL;
@@ -173,6 +174,7 @@ void websocket_schedule_setup(uint32_t generation)
 void websocket_app_start(void)
 {
     ESP_LOGI(TAG, "Memulai Gemini WebSocket - Repo3 transport baseline");
+    intentional_standby = false;
     if (!wifi_is_ready() || client || ws_started) return;
     if (!audio_engine_init()) return;
     reset_rx_buffer(); websocket_tx_flush_queue();
@@ -192,4 +194,23 @@ void websocket_app_start(void)
 
 bool websocket_is_connected(void) { return is_connected && setup_complete && !websocket_tx_error; }
 void websocket_disconnect(void) { if (client != NULL) (void)esp_websocket_client_close(client, pdMS_TO_TICKS(1000)); }
+
+void websocket_end_session(void)
+{
+    intentional_standby = true;
+    is_connected = false;
+    setup_complete = false;
+    websocket_tx_error = false;
+    websocket_connection_generation = websocket_connection_generation + 1;
+    websocket_tx_flush_queue();
+    ESP_LOGI(TAG, "WS: Gemini session dihentikan sengaja; kembali menunggu Wake Word");
+    if (client != NULL)
+        (void)esp_websocket_client_close(client, pdMS_TO_TICKS(1000));
+}
+
+bool websocket_is_intentional_standby(void)
+{
+    return intentional_standby;
+}
+
 void websocket_reset_started(void) { ws_started = false; }
