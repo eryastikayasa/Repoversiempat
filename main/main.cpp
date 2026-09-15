@@ -186,6 +186,19 @@ static void app_supervisor_task(void *arg)
             continue;
         }
 
+        /* Intentional Gemini standby is terminal for this session.
+         * Do not reconnect/resume until Wake Word starts a new session. */
+        if (websocket_is_intentional_standby()) {
+            ESP_LOGI(TAG, "Gemini STANDBY: session selesai, menunggu Wake Word");
+            assistant_active = false;
+            wake_requested = false;
+            audio_engine_stop_input_session();
+            display_face_set_state(FACE_SLEEP);
+            reconnect_attempts = 0;
+            vTaskDelay(pdMS_TO_TICKS(100));
+            continue;
+        }
+
         /* AudioEngine owns the 60-second audio-idle decision. */
         if (!audio_engine_input_session_active()) {
             ESP_LOGI(TAG, "AudioEngine mengakhiri sesi MIC");
