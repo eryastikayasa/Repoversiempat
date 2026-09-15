@@ -174,8 +174,26 @@ void websocket_schedule_setup(uint32_t generation)
 void websocket_app_start(void)
 {
     ESP_LOGI(TAG, "Memulai Gemini WebSocket - Repo3 transport baseline");
+
+    /* After intentional standby, the old websocket client is destroyed by the
+     * lifecycle cleanup worker only after WEBSOCKET_EVENT_FINISH. A new Wake
+     * Word can arrive quickly, so wait briefly for that hand-off instead of
+     * starting a second client against the same handle. */
+    if (client || ws_started) {
+        if (intentional_standby) {
+            const TickType_t wait_step = pdMS_TO_TICKS(50);
+            const int max_wait_steps = 60; /* 3 seconds */
+            for (int i = 0; i < max_wait_steps && (client || ws_started); ++i)
+                vTaskDelay(wait_step);
+        }
+        if (client || ws_started) {
+            ESP_LOGW(TAG, "WebSocket lama masih cleanup; sesi baru ditunda");
+            return;
+        }
+    }
+
     intentional_standby = false;
-    if (!wifi_is_ready() || client || ws_started) return;
+    if (!wifi_is_ready()) return;
     if (!audio_engine_init()) return;
     reset_rx_buffer(); websocket_tx_flush_queue();
     if (!websocket_tx_init() || !websocket_rx_init()) return;
