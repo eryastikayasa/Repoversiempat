@@ -5,7 +5,6 @@
 #include "esp_websocket_client.h"
 #include "esp_crt_bundle.h"
 #include "mbedtls/base64.h"
-#include "esp_heap_caps.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -28,45 +27,36 @@ QueueHandle_t websocket_tx_queue = NULL;
 TaskHandle_t websocket_tx_task_handle = NULL;
 static TaskHandle_t websocket_cleanup_task_handle = NULL;
 
-static void log_ws_heap(const char *where)
-{
-    ESP_LOGI(TAG, "HEAP[%s]: free=%u largest=%u", where,
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
-}
-
-static void websocket_tx_fail(void)
-{
-    websocket_tx_error = true;
-    is_connected = false;
-    setup_complete = false;
-    ESP_LOGE(TAG, "WebSocket TX failure: audio/control TX dihentikan");
-
-    /* TX worker is not the websocket event callback, so it is safe to ask
-     * the client to close. The lifecycle worker will destroy the handle only
-     * after FINISH, preventing reconnects from racing the old client. */
-    esp_websocket_client_handle_t ws = client;
-    if (ws && esp_websocket_client_is_connected(ws))
-        (void)esp_websocket_client_close(ws, pdMS_TO_TICKS(1000));
-}
-
 void websocket_tx_flush_queue(void)
 {
     if (!websocket_tx_queue) return;
     ws_tx_command_t stale = {};
-    unsigned flushed = 0;
+    size_t flushed = 0;
     while (xQueueReceive(websocket_tx_queue, &stale, 0) == pdTRUE) {
         if (stale.data) free(stale.data);
         ++flushed;
     }
-    if (flushed) ESP_LOGW(TAG, "TX queue dibersihkan: %u command", flushed);
+    if (flushed) ESP_LOGW(TAG, "TX queue dibersihkan: %u command", (unsigned)flushed);
+}
+
+static void websocket_tx_fail(void)
+{
+    /* Match Repo3: a failed write invalidates the current generation and
+     * stops producers, but does not recursively close the WebSocket from the
+     * TX worker. The normal lifecycle path owns close/destroy. */
+    websocket_tx_error = true;
+    is_connected = false;
+    setup_complete = false;
+    ++websocket_connection_generation;
+    websocket_tx_flush_queue();
+    ESP_LOGW(TAG, "TX failure: audio producer dihentikan, generation=%lu",
+             (unsigned long)websocket_connection_generation);
 }
 
 static void websocket_cleanup_task(void *arg)
 {
     (void)arg;
     ESP_LOGI(TAG, "WebSocket lifecycle cleanup worker siap");
-
     for (;;) {
         if (websocket_cleanup_is_pending()) {
             esp_websocket_client_handle_t ws = client;
@@ -92,7 +82,7 @@ static void websocket_tx_task(void *arg)
 {
     (void)arg;
     ws_tx_command_t cmd = {};
-    ESP_LOGI(TAG, "WebSocket TX worker dimulai - V7.0.33");
+    ESP_LOGI(TAG, "WebSocket TX worker dimulai - Repo3 transport behavior");
 
     for (;;) {
         if (xQueueReceive(websocket_tx_queue, &cmd, portMAX_DELAY) != pdTRUE)
@@ -131,21 +121,21 @@ static void websocket_tx_task(void *arg)
 
             int sent = esp_websocket_client_send_text(
                 ws, setup_json, (int)setup_len, pdMS_TO_TICKS(5000));
-            if (sent != (int)setup_len) {
+            if (sent != (int)setup_len)
                 websocket_tx_fail();
-            } else {
+            else
                 ESP_LOGI(TAG, "Setup Gemini terkirim: %d byte generation=%lu",
-                         sent, (unsigned)cmd.generation);
-            }
+                         sent, (unsigned long)cmd.generation);
+
             free(setup_json);
             free(audio_data);
             continue;
         }
 
         if (cmd.type == WS_TX_COMMAND_AUDIO) {
+            static char b64_buf[2300];
+            static char json_buf[2500];
             constexpr size_t PCM_SEND_CHUNK = 1600;
-            constexpr size_t AUDIO_AGGREGATE_MAX = WS_TX_AUDIO_SIZE;
-            constexpr TickType_t AUDIO_AGGREGATE_WAIT = pdMS_TO_TICKS(100);
             constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
             constexpr TickType_t AUDIO_SEND_RETRY_DELAY = pdMS_TO_TICKS(30);
             constexpr int AUDIO_SEND_RETRIES = 1;
@@ -155,60 +145,9 @@ static void websocket_tx_task(void *arg)
                 continue;
             }
 
-            /* AudioEngine intentionally stays at 320B/20ms. At the WebSocket
-             * boundary, collect several frames so TLS sees ~100ms/1600B
-             * writes, matching the proven Repoversitiga transport cadence. */
-            uint8_t *aggregate = (uint8_t *)malloc(AUDIO_AGGREGATE_MAX);
-            if (!aggregate) {
-                ESP_LOGW(TAG, "TX aggregate buffer malloc gagal");
-                free(audio_data);
-                continue;
-            }
-
-            size_t aggregate_len = 0;
-            if (cmd.len <= AUDIO_AGGREGATE_MAX) {
-                memcpy(aggregate, audio_data, cmd.len);
-                aggregate_len = cmd.len;
-            }
-            free(audio_data);
-            audio_data = NULL;
-
-            const TickType_t wait_start = xTaskGetTickCount();
-            while (aggregate_len < PCM_SEND_CHUNK) {
-                const TickType_t elapsed = xTaskGetTickCount() - wait_start;
-                if (elapsed >= AUDIO_AGGREGATE_WAIT) break;
-
-                ws_tx_command_t next = {};
-                TickType_t remaining = AUDIO_AGGREGATE_WAIT - elapsed;
-                if (xQueueReceive(websocket_tx_queue, &next, remaining) != pdTRUE)
-                    break;
-
-                if (next.type != WS_TX_COMMAND_AUDIO ||
-                    next.generation != cmd.generation || !next.data || !next.len) {
-                    if (next.data) free(next.data);
-                    continue;
-                }
-
-                size_t copy_len = next.len;
-                if (copy_len > AUDIO_AGGREGATE_MAX - aggregate_len)
-                    copy_len = AUDIO_AGGREGATE_MAX - aggregate_len;
-                memcpy(aggregate + aggregate_len, next.data, copy_len);
-                aggregate_len += copy_len;
-                free(next.data);
-
-                if (copy_len != next.len) {
-                    ESP_LOGW(TAG, "TX aggregate overflow: dropped=%uB",
-                             (unsigned)(next.len - copy_len));
-                    break;
-                }
-            }
-
             size_t offset = 0;
             bool send_failed = false;
-            static char b64_buf[2300];
-            static char json_buf[2500];
-
-            while (offset < aggregate_len) {
+            while (offset < cmd.len) {
                 if (cmd.generation != websocket_connection_generation ||
                     !is_connected || websocket_tx_error || client != ws ||
                     !esp_websocket_client_is_connected(ws)) {
@@ -216,7 +155,7 @@ static void websocket_tx_task(void *arg)
                     break;
                 }
 
-                size_t chunk_len = aggregate_len - offset;
+                size_t chunk_len = cmd.len - offset;
                 if (chunk_len > PCM_SEND_CHUNK) chunk_len = PCM_SEND_CHUNK;
 
                 size_t encoded_len = 0;
@@ -224,7 +163,7 @@ static void websocket_tx_task(void *arg)
                     (unsigned char *)b64_buf,
                     sizeof(b64_buf) - 1,
                     &encoded_len,
-                    aggregate + offset,
+                    audio_data + offset,
                     chunk_len);
                 if (ret != 0) {
                     ESP_LOGW(TAG, "TX audio base64 gagal: ret=%d chunk=%u",
@@ -239,57 +178,50 @@ static void websocket_tx_task(void *arg)
                     sizeof(json_buf),
                     "{\"realtimeInput\":{\"audio\":{\"mimeType\":\"audio/pcm;rate=16000\",\"data\":\"%s\"}}}",
                     b64_buf);
-                if (json_len <= 0 || (size_t)json_len >= sizeof(json_buf)) {
+                if (json_len < 0 || (size_t)json_len >= sizeof(json_buf)) {
                     ESP_LOGW(TAG, "TX audio JSON terlalu besar: chunk=%u",
                              (unsigned)chunk_len);
                     send_failed = true;
                     break;
                 }
 
-                bool sent_ok = false;
-                for (int retry = 0; retry <= AUDIO_SEND_RETRIES; ++retry) {
+                bool chunk_sent = false;
+                for (int attempt = 0; attempt <= AUDIO_SEND_RETRIES; ++attempt) {
                     if (cmd.generation != websocket_connection_generation ||
                         !is_connected || websocket_tx_error || client != ws ||
                         !esp_websocket_client_is_connected(ws)) {
                         break;
                     }
-                    if (retry > 0) {
+                    if (attempt > 0) {
                         vTaskDelay(AUDIO_SEND_RETRY_DELAY);
                         if (cmd.generation != websocket_connection_generation ||
                             !is_connected || websocket_tx_error || client != ws ||
                             !esp_websocket_client_is_connected(ws))
                             break;
                     }
-
                     int sent = esp_websocket_client_send_text(
                         ws, json_buf, json_len, AUDIO_SEND_TIMEOUT);
                     if (sent == json_len) {
-                        sent_ok = true;
+                        chunk_sent = true;
                         break;
                     }
                     ESP_LOGW(TAG,
                              "TX audio write timeout/fail: attempt=%d sent=%d expected=%d pcm_chunk=%u offset=%u/%u timeout=3000ms",
-                             retry + 1, sent, json_len, (unsigned)chunk_len,
-                             (unsigned)offset, (unsigned)aggregate_len);
+                             attempt + 1, sent, json_len, (unsigned)chunk_len,
+                             (unsigned)offset, (unsigned)cmd.len);
                 }
-
-                if (!sent_ok) {
+                if (!chunk_sent) {
                     send_failed = true;
                     break;
                 }
                 offset += chunk_len;
             }
 
-            if (send_failed) {
+            if (send_failed)
                 ESP_LOGW(TAG, "TX audio command dihentikan: sent_pcm=%u/%u",
-                         (unsigned)offset, (unsigned)aggregate_len);
-                websocket_tx_fail();
-            } else {
-                ESP_LOGD(TAG, "TX audio aggregate terkirim: %uB PCM",
-                         (unsigned)aggregate_len);
-            }
+                         (unsigned)offset, (unsigned)cmd.len);
 
-            free(aggregate);
+            free(audio_data);
             continue;
         }
 
@@ -303,20 +235,16 @@ bool websocket_tx_init(void)
         websocket_tx_queue = xQueueCreate(WS_TX_QUEUE_LENGTH, sizeof(ws_tx_command_t));
         if (!websocket_tx_queue) return false;
     }
-
     if (!websocket_tx_task_handle) {
         if (xTaskCreate(websocket_tx_task, "ws_tx", 8192, NULL, 4,
                         &websocket_tx_task_handle) != pdPASS)
             return false;
     }
-
     if (!websocket_cleanup_task_handle) {
         if (xTaskCreate(websocket_cleanup_task, "ws_cleanup", 3072, NULL, 3,
                         &websocket_cleanup_task_handle) != pdPASS)
             return false;
     }
-
-    log_ws_heap("after_ws_tx_init");
     return true;
 }
 
@@ -338,11 +266,16 @@ bool websocket_tx_enqueue_audio(const uint8_t *data, size_t len, uint32_t genera
     cmd.data = copy;
 
     if (xQueueSend(websocket_tx_queue, &cmd, 0) != pdTRUE) {
-        /* With the larger queue, prefer rejecting a new frame over silently
-         * deleting an older frame. The caller's periodic stream can recover
-         * on the next frame without corrupting the queued timeline. */
-        free(copy);
-        return false;
+        /* Match Repo3: discard the oldest queued audio command, then admit
+         * the newest frame. This keeps the realtime stream moving rather than
+         * letting producer backpressure accumulate indefinitely. */
+        ws_tx_command_t stale = {};
+        if (xQueueReceive(websocket_tx_queue, &stale, 0) == pdTRUE && stale.data)
+            free(stale.data);
+        if (xQueueSend(websocket_tx_queue, &cmd, 0) != pdTRUE) {
+            free(copy);
+            return false;
+        }
     }
     return true;
 }
@@ -363,13 +296,13 @@ void websocket_schedule_setup(uint32_t generation)
 
 void websocket_app_start(void)
 {
-    ESP_LOGI(TAG, "Memulai Gemini WebSocket V7.0.33");
+    ESP_LOGI(TAG, "Memulai Gemini WebSocket - Repo3 transport baseline");
     if (!wifi_is_ready() || client || ws_started) return;
     if (!audio_engine_init()) {
         ESP_LOGE(TAG, "AudioEngine gagal init - WebSocket audio dibatalkan");
         return;
     }
-    log_ws_heap("after_audio_engine_init");
+
     reset_rx_buffer();
     websocket_tx_flush_queue();
     if (!websocket_tx_init() || !websocket_rx_init()) return;
@@ -391,17 +324,9 @@ void websocket_app_start(void)
     cfg.keep_alive_interval = 10;
     cfg.keep_alive_count = 3;
     cfg.buffer_size = 8192;
-    ESP_LOGI(TAG, "V7.0.33: audio aggregate=1600B, wait=100ms, TX queue=%d, cleanup worker=ON",
-             WS_TX_QUEUE_LENGTH);
-    log_ws_heap("before_websocket_client_init");
 
     client = esp_websocket_client_init(&cfg);
-    if (!client) {
-        log_ws_heap("websocket_client_init_FAILED");
-        return;
-    }
-    log_ws_heap("after_websocket_client_init");
-
+    if (!client) return;
     esp_err_t err = esp_websocket_register_events(
         client, WEBSOCKET_EVENT_ANY, websocket_event_handler, (void *)client);
     if (err != ESP_OK) {
@@ -409,7 +334,6 @@ void websocket_app_start(void)
         client = NULL;
         return;
     }
-
     err = esp_websocket_client_start(client);
     if (err != ESP_OK) {
         esp_websocket_client_destroy(client);
