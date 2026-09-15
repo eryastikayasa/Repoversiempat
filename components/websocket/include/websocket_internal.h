@@ -12,16 +12,13 @@
 #define SESSION_HANDLE_MAX_LEN 1024
 #define WS_RX_MAX_PAYLOAD_SIZE (48 * 1024)
 #define WS_RX_SLOT_SIZE (40 * 1024)
-/* v7.0.31: increase persistent RX slot headroom after v7.0.30 showed
- * buffer_drop=4 and queue_hwm=4 during Gemini audio bursts. */
+/* Keep Repo4's persistent RX pool; only the TX transport depth follows Repo3. */
 #define WS_RX_SLOT_COUNT 16
 #define WS_RX_TERMINATOR_SIZE 1
 #define WS_RX_STREAM_THRESHOLD (8 * 1024)
 #define WS_RX_STREAM_COMPACT_SIZE (8 * 1024)
 #define WS_TX_AUDIO_SIZE 3200
-/* AudioEngine produces 20ms/320B frames. Keep enough headroom for
- * short TLS/WebSocket stalls while the TX worker aggregates frames. */
-#define WS_TX_QUEUE_LENGTH 10
+#define WS_TX_QUEUE_LENGTH 3
 #define WS_RX_QUEUE_LENGTH WS_RX_SLOT_COUNT
 
 typedef enum { WS_TX_COMMAND_SETUP = 1, WS_TX_COMMAND_AUDIO = 2 } ws_tx_command_type_t;
