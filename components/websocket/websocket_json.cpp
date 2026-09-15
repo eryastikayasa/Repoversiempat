@@ -100,7 +100,7 @@ static void add_device_control_tool(cJSON *setup)
     cJSON *properties = cJSON_AddObjectToObject(parameters, "properties");
     cJSON *command = cJSON_AddObjectToObject(properties, "command");
     cJSON_AddStringToObject(command, "type", "STRING");
-    cJSON_AddStringToObject(command, "description", "Command perangkat yang harus dijalankan sebagai satu kali tekan tombol fisik.");
+    cJSON_AddStringToObject(command, "description", "Command perangkat yang harus dijalankan sebagai satu kali tekan tombol fisik, atau standby_gemini untuk mengakhiri session Gemini tanpa menekan perangkat fisik.");
 
     cJSON *enum_values = cJSON_AddArrayToObject(command, "enum");
     static const char *const commands[] = {
@@ -110,7 +110,8 @@ static void add_device_control_tool(cJSON *setup)
         "m_led", "m_mute", "m_musik", "m_cek",
         "cek_suhu", "cek_cahaya",
         "face_idle", "face_listening", "face_thinking", "face_speaking",
-        "face_happy", "face_sad", "face_error", "face_sleep"
+        "face_happy", "face_sad", "face_error", "face_sleep",
+        "standby_gemini"
     };
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i)
         cJSON_AddItemToArray(enum_values, cJSON_CreateString(commands[i]));
@@ -155,6 +156,7 @@ bool build_gemini_setup(char **output, size_t *output_len)
     "Jika pengguna meminta kamu menampilkan ekspresi wajah, gunakan control_device dengan command Face yang sesuai. "
     "Gunakan face_happy untuk senyum atau bahagia, face_sad untuk sedih atau menangis, face_thinking untuk berpikir, face_listening untuk mendengarkan, face_speaking untuk berbicara, face_error untuk kesalahan atau kaget, face_sleep untuk tidur, dan face_idle untuk ekspresi netral. "
     "Setiap command Face akan tampil selama 5 detik lalu kembali ke ekspresi sebelumnya. "
+    "Jika pengguna mengatakan atau meminta \"standby\", \"standby dulu\", \"berhenti\", \"selesai\", \"akhiri percakapan\", atau meminta Gemini kembali menunggu Wake Word, gunakan control_device dengan command standby_gemini. Command ini bukan tombol perangkat dan hanya mengakhiri session Gemini saat ini. Setelah standby, jangan mencoba melanjutkan atau meresume session tersebut. Perangkat kembali menunggu Wake Word \"Hi, ESP\" untuk memulai session baru. "
     "Tunggu hasil fungsi sebelum menyatakan tombol berhasil ditekan. Jangan pernah mengucapkan nama command UART kepada pengguna.");
     cJSON_AddItemToArray(system_parts, system_text);
     static char role_text[2048];
@@ -185,7 +187,7 @@ bool build_gemini_setup(char **output, size_t *output_len)
     }
     *output = json;
     *output_len = strlen(json);
-    ESP_LOGI(TAG, "Gemini setup: AUDIO + id-ID + AAD HIGH + prefix=40ms + silence=500ms + UART TOOL");
+    ESP_LOGI(TAG, "Gemini setup: AUDIO + id-ID + AAD HIGH + prefix=40ms + silence=500ms + UART + STANDBY TOOL");
     return true;
 }
 
@@ -236,11 +238,18 @@ static void process_gemini_tool_call(cJSON *tool_call)
         }
         ESP_LOGI(TAG, "Gemini TOOL CALL: %s id=%s", name->valuestring, id->valuestring);
         bool success = false;
+        bool terminal_standby = false;
         if (strcmp(name->valuestring, "control_device") == 0) {
             cJSON *command = cJSON_GetObjectItem(args, "command");
             if (cJSON_IsString(command) && command->valuestring) {
                 const char *cmd = command->valuestring;
-                if (strcmp(cmd, "face_idle") == 0) {
+                if (strcmp(cmd, "standby_gemini") == 0) {
+                    ESP_LOGI(TAG, "GEMINI STANDBY TOOL: mengakhiri session secara sengaja");
+                    websocket_end_session();
+                    success = true;
+                    terminal_standby = true;
+                }
+                else if (strcmp(cmd, "face_idle") == 0) {
                     display_face_show_for_ms(FACE_IDLE, 5000);
                     success = true;
                 }
@@ -281,7 +290,7 @@ static void process_gemini_tool_call(cJSON *tool_call)
                 ESP_LOGW(TAG, "control_device tanpa argument command");
             }
         }
-        if (!websocket_send_tool_response(id->valuestring, name->valuestring, success))
+        if (!terminal_standby && !websocket_send_tool_response(id->valuestring, name->valuestring, success))
             ESP_LOGW(TAG, "Gagal mengirim toolResponse ke Gemini");
     }
 }
