@@ -18,3 +18,7 @@ void websocket_app_start(void);
 void websocket_send_audio_data(const uint8_t *data, size_t len);
 bool websocket_is_connected(void);
 void websocket_disconnect(void);
+
+// Mengakhiri session Gemini secara sengaja dan kembali menunggu Wake Word.
+void websocket_end_session(void);
+bool websocket_is_intentional_standby(void);
