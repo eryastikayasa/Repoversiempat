@@ -155,8 +155,12 @@ static void start_assistant_session(void)
     wake_requested = false;
     reconnect_attempts = 0;
     connect_start_us = esp_timer_get_time();
-    audio_engine_start_input_session();
+
+    /* WakeNet remains the MIC owner until Gemini setupComplete is ready.
+     * The supervisor activates the Gemini input session only after
+     * websocket_is_connected() becomes true. */
     display_face_set_state(FACE_HAPPY);
+    ESP_LOGI(TAG, "GEMINI_SESSION_START: menunggu WebSocket + setupComplete sebelum MIC TX");
     websocket_app_start();
 }
 
@@ -199,17 +203,43 @@ static void app_supervisor_task(void *arg)
             continue;
         }
 
-        /* AudioEngine owns the 60-second audio-idle decision. */
+        /* Do not hand MIC TX to Gemini until the WebSocket transport has
+         * completed Gemini setup. WakeNet is logically paused while
+         * assistant_active is true, but AudioEngine keeps capture/framing
+         * running without enqueueing stale Gemini frames. */
         if (!audio_engine_input_session_active()) {
-            ESP_LOGI(TAG, "AudioEngine mengakhiri sesi MIC");
-            assistant_active = false;
-            websocket_disconnect();
-            display_face_set_state(FACE_SLEEP);
-            reconnect_attempts = 0;
-            vTaskDelay(pdMS_TO_TICKS(100));
+            if (websocket_is_connected()) {
+                ESP_LOGI(TAG, "GEMINI_SETUP_COMPLETE: handoff MIC -> Gemini");
+                audio_engine_start_input_session();
+                ESP_LOGI(TAG, "MIC_TX_READY: AudioEngine -> Gemini");
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+
+            ESP_LOGI(TAG, "AudioEngine belum aktif: menunggu Gemini setupComplete");
+            if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) {
+                if (reconnect_attempts < 5) {
+                    const int delay_sec = 2 << reconnect_attempts;
+                    ++reconnect_attempts;
+                    ESP_LOGW(TAG, "Reconnect attempt %d in %d sec...",
+                             reconnect_attempts, delay_sec);
+                    vTaskDelay(pdMS_TO_TICKS(delay_sec * 1000));
+                    websocket_app_start();
+                    connect_start_us = esp_timer_get_time();
+                } else {
+                    ESP_LOGW(TAG, "Reconnect gagal, kembali ke mode sleep.");
+                    assistant_active = false;
+                    audio_engine_stop_input_session();
+                    display_face_set_state(FACE_SLEEP);
+                    reconnect_attempts = 0;
+                }
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(100));
+            }
             continue;
         }
 
+        /* AudioEngine owns the 60-second audio-idle decision. */
         if (!websocket_is_connected()) {
             if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) {
                 if (reconnect_attempts < 5) {
