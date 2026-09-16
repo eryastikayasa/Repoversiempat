@@ -90,6 +90,14 @@ static void capture_task(void *arg)
     bool tx_batch_has_activity = false;
     bool tx_speech_active = false;
 
+    auto reset_tx_batch = [&]() {
+        tx_batch_pos = 0;
+        tx_batch_has_activity = false;
+        memset(tx_batch, 0, sizeof(tx_batch));
+    };
+
+    reset_tx_batch();
+
     ESP_LOGI(TAG, "Mic capture owner aktif: PCM16 16kHz, frame=%uB, TX batch=%uB, read=%uB, idle=%ums, stack=8192",
              (unsigned)MIC_FRAME_BYTES, (unsigned)MIC_TX_BATCH_BYTES,
              (unsigned)MIC_READ_BYTES, (unsigned)MIC_IDLE_TIMEOUT_MS);
@@ -118,8 +126,7 @@ static void capture_task(void *arg)
             frame_pos = 0;
 
             if (!s_input_session_active) {
-                tx_batch_pos = 0;
-                tx_batch_has_activity = false;
+                reset_tx_batch();
                 tx_speech_active = false;
                 vTaskDelay(1);
                 continue;
@@ -127,8 +134,7 @@ static void capture_task(void *arg)
 
             /* Keep the existing capture-side model-turn gate. */
             if (audio_engine_turn_active()) {
-                tx_batch_pos = 0;
-                tx_batch_has_activity = false;
+                reset_tx_batch();
                 tx_speech_active = false;
                 vTaskDelay(1);
                 continue;
@@ -139,7 +145,6 @@ static void capture_task(void *arg)
             if (active) {
                 s_last_activity_us = now_us;
                 tx_speech_active = true;
-                tx_batch_has_activity = true;
             }
 
             if (s_last_activity_us != 0 &&
@@ -147,29 +152,33 @@ static void capture_task(void *arg)
                 ESP_LOGI(TAG, "Input idle %ums: AudioEngine mengakhiri sesi MIC",
                          (unsigned)MIC_IDLE_TIMEOUT_MS);
                 s_input_session_active = false;
-                tx_batch_pos = 0;
-                tx_batch_has_activity = false;
+                reset_tx_batch();
                 tx_speech_active = false;
                 flush_mic_tx_queue();
                 vTaskDelay(1);
                 continue;
             }
 
-            /* Preserve a short trailing silence window so Gemini's server VAD
-             * can observe end-of-speech. Repo4 no longer floods the TX queue
-             * with silence before speech or long after speech has ended. */
+            /* Once speech starts, keep streaming for a bounded trailing silence
+             * window so Gemini server VAD can detect end-of-speech. Before speech
+             * and after this tail, silence is not put into the TX queue. */
             if (tx_speech_active &&
                 s_last_activity_us != 0 &&
                 now_us - s_last_activity_us >= (int64_t)MIC_VAD_HANGOVER_MS * 1000LL) {
                 tx_speech_active = false;
             }
 
-            if (tx_speech_active || tx_batch_has_activity) {
+            if (tx_speech_active) {
                 memcpy(tx_batch + tx_batch_pos, frame_buffer, MIC_FRAME_BYTES);
                 tx_batch_pos += MIC_FRAME_BYTES;
+                tx_batch_has_activity = true;
             }
 
-            if (tx_batch_pos == MIC_TX_BATCH_BYTES) {
+            /* If the VAD tail expired with a partial batch, pad the remainder
+             * with silence and send it. This avoids losing the final speech
+             * frames while keeping the WebSocket cadence at 1600 PCM bytes. */
+            const bool tail_expired = !tx_speech_active && tx_batch_has_activity;
+            if (tx_batch_pos == MIC_TX_BATCH_BYTES || tail_expired) {
                 if (s_tx_queue && s_mic_sink && tx_batch_has_activity &&
                     xQueueSend(s_tx_queue, tx_batch, 0) != pdTRUE) {
                     ++s_tx_queue_drops;
@@ -177,8 +186,7 @@ static void capture_task(void *arg)
                         ESP_LOGW(TAG, "MIC transport queue penuh; batch drop total=%u",
                                  (unsigned)s_tx_queue_drops);
                 }
-                tx_batch_pos = 0;
-                tx_batch_has_activity = false;
+                reset_tx_batch();
             }
 
             vTaskDelay(1);
