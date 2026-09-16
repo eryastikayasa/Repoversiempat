@@ -73,6 +73,18 @@ static void app_supervisor_task(void *arg)
 
     for (;;) {
         if (!assistant_active) {
+            /* Match Repo5: the AudioEngine WakeWord task latches detection,
+             * and the application supervisor consumes that event to start the
+             * Gemini session. Do not rely on the legacy wake_requested flag. */
+            if (audio_engine_wakeword_detected()) {
+                ESP_LOGI(TAG, "MAIN: WakeWord event -> mulai sesi Gemini");
+                audio_engine_clear_wakeword();
+                wake_requested = false;
+                start_assistant_session();
+                vTaskDelay(pdMS_TO_TICKS(20));
+                continue;
+            }
+
             if (wake_requested) {
                 ESP_LOGI(TAG, "Wake request diterima supervisor. Memulai sesi...");
                 start_assistant_session();
