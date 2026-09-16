@@ -1,5 +1,6 @@
 #include "audio_engine.h"
 #include "audio_hal.h"
+#include "wakeword.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -11,22 +12,29 @@
 
 static const char *TAG = "AUDIO_ENGINE_MIC";
 
+static constexpr size_t WAKEWORD_READ_SAMPLES = 512U;
+static constexpr uint32_t WAKEWORD_TASK_STACK = 8192U;
+static constexpr UBaseType_t WAKEWORD_TASK_PRIORITY = 6U;
+
 static constexpr size_t MIC_FRAME_BYTES = 320U; // 20 ms @ 16 kHz PCM16 mono
-static constexpr size_t MIC_TX_BATCH_BYTES = 1600U; // 100 ms, matching Repo3 WS transport cadence
-static constexpr size_t MIC_READ_BYTES = 4096U;
+static constexpr size_t MIC_TX_BATCH_BYTES = 1600U; // 100 ms
+static constexpr size_t MIC_READ_BYTES = 4096U; // 1024 PCM16 samples
 static constexpr uint32_t MIC_IDLE_TIMEOUT_MS = 60000U;
 static constexpr uint32_t MIC_VAD_HANGOVER_MS = 500U;
 static constexpr int32_t MIC_ACTIVITY_THRESHOLD = 80;
 static constexpr size_t MIC_ACTIVITY_MIN_SAMPLES = 8U;
 static constexpr size_t MIC_TX_QUEUE_DEPTH = 16U;
+static constexpr uint32_t CONVERSATION_TASK_STACK = 8192U;
+static constexpr UBaseType_t CONVERSATION_TASK_PRIORITY = 5U;
 
-static audio_engine_mic_frame_cb_t s_mic_listener = nullptr;
-static void *s_mic_listener_ctx = nullptr;
 static audio_engine_mic_sink_cb_t s_mic_sink = nullptr;
 static void *s_mic_sink_ctx = nullptr;
 static volatile bool s_capture_started = false;
 static volatile bool s_input_session_active = false;
+static volatile bool s_wakeword_running = false;
+static volatile bool s_wakeword_detected = false;
 static int64_t s_last_activity_us = 0;
+static TaskHandle_t s_wakeword_task = nullptr;
 static TaskHandle_t s_capture_task = nullptr;
 static TaskHandle_t s_sink_task = nullptr;
 
@@ -52,15 +60,73 @@ static bool frame_has_activity(const uint8_t *data, size_t len)
 
 static void flush_mic_tx_queue(void)
 {
-    if (s_tx_queue)
-        (void)xQueueReset(s_tx_queue);
+    if (s_tx_queue) (void)xQueueReset(s_tx_queue);
+}
+
+static void wakeword_task(void *arg)
+{
+    (void)arg;
+    static int16_t pcm[WAKEWORD_READ_SAMPLES];
+
+    ESP_LOGI(TAG,
+             "WakeWord task START: model=wn9_hiesp rate=16000Hz chunk=%d stack=%u priority=%u",
+             wakeword_get_chunk_samples(),
+             (unsigned)WAKEWORD_TASK_STACK,
+             (unsigned)WAKEWORD_TASK_PRIORITY);
+
+    while (s_wakeword_running) {
+        size_t samples_read = 0;
+        const esp_err_t err = audio_hal_read_pcm(
+            pcm, WAKEWORD_READ_SAMPLES, &samples_read);
+
+        if (err != ESP_OK) {
+            if (s_wakeword_running) {
+                ESP_LOGE(TAG, "WakeWord MIC read gagal: %s", esp_err_to_name(err));
+                vTaskDelay(1);
+            }
+            continue;
+        }
+
+        if (samples_read == 0) {
+            vTaskDelay(1);
+            continue;
+        }
+
+        if (wakeword_process_pcm16(pcm, samples_read)) {
+            s_wakeword_detected = true;
+            ESP_LOGI(TAG, "WakeWord event diterima AudioEngine");
+        }
+
+        vTaskDelay(1);
+    }
+
+    s_wakeword_task = nullptr;
+    ESP_LOGI(TAG, "WakeWord task STOP");
+    vTaskDelete(nullptr);
+}
+
+static bool stop_wakeword_and_wait(void)
+{
+    if (!s_wakeword_running && s_wakeword_task == nullptr) return true;
+
+    s_wakeword_running = false;
+    (void)audio_hal_stop_capture();
+
+    for (uint32_t i = 0; i < 200 && s_wakeword_task != nullptr; ++i)
+        vTaskDelay(1);
+
+    if (s_wakeword_task != nullptr) {
+        ESP_LOGE(TAG, "WakeWord task belum berhenti; MIC ownership tetap dikunci");
+        return false;
+    }
+    return true;
 }
 
 static void sink_task(void *arg)
 {
     (void)arg;
     uint8_t batch[MIC_TX_BATCH_BYTES];
-    ESP_LOGI(TAG, "Mic transport worker aktif; capture/WakeNet tidak mengerjakan TX");
+    ESP_LOGI(TAG, "Mic transport worker aktif; WakeWord/conversation tidak mengerjakan TX");
 
     for (;;) {
         if (xQueueReceive(s_tx_queue, batch, portMAX_DELAY) != pdTRUE)
@@ -69,8 +135,6 @@ static void sink_task(void *arg)
         audio_engine_mic_sink_cb_t sink = s_mic_sink;
         void *sink_ctx = s_mic_sink_ctx;
 
-        /* Race-safe second gate: a batch can already be queued when Gemini
-         * starts speaking. Never transmit stale microphone audio in that turn. */
         if (!sink || !s_input_session_active || audio_engine_turn_active())
             continue;
 
@@ -78,10 +142,9 @@ static void sink_task(void *arg)
     }
 }
 
-static void capture_task(void *arg)
+static void conversation_task(void *arg)
 {
     (void)arg;
-
     static uint8_t read_buffer[MIC_READ_BYTES];
     static uint8_t frame_buffer[MIC_FRAME_BYTES];
     static uint8_t tx_batch[MIC_TX_BATCH_BYTES];
@@ -97,27 +160,38 @@ static void capture_task(void *arg)
     };
 
     reset_tx_batch();
+    ESP_LOGI(TAG,
+             "Conversation MIC owner START: PCM16 16kHz frame=%uB TX batch=%uB read=%uB stack=%u",
+             (unsigned)MIC_FRAME_BYTES,
+             (unsigned)MIC_TX_BATCH_BYTES,
+             (unsigned)MIC_READ_BYTES,
+             (unsigned)CONVERSATION_TASK_STACK);
 
-    ESP_LOGI(TAG, "Mic capture owner aktif: PCM16 16kHz, frame=%uB, TX batch=%uB, read=%uB, idle=%ums, stack=8192",
-             (unsigned)MIC_FRAME_BYTES, (unsigned)MIC_TX_BATCH_BYTES,
-             (unsigned)MIC_READ_BYTES, (unsigned)MIC_IDLE_TIMEOUT_MS);
+    while (s_input_session_active) {
+        size_t samples_read = 0;
+        const esp_err_t err = audio_hal_read_pcm(
+            reinterpret_cast<int16_t *>(read_buffer),
+            MIC_READ_BYTES / sizeof(int16_t),
+            &samples_read);
 
-    for (;;) {
-        const size_t bytes = audio_read_mic(read_buffer, sizeof(read_buffer));
-        if (bytes == 0) {
+        if (err != ESP_OK) {
+            if (s_input_session_active) {
+                ESP_LOGE(TAG, "Conversation MIC read gagal: %s", esp_err_to_name(err));
+                vTaskDelay(1);
+            }
+            continue;
+        }
+        if (samples_read == 0) {
             vTaskDelay(1);
             continue;
         }
 
-        /* WakeNet receives the same contiguous PCM read produced by Audio HAL. */
-        if (s_mic_listener)
-            s_mic_listener(read_buffer, bytes, s_mic_listener_ctx);
-
+        const size_t bytes_read = samples_read * sizeof(int16_t);
         size_t offset = 0;
-        while (offset < bytes) {
-            const size_t copy_len = (MIC_FRAME_BYTES - frame_pos < bytes - offset)
-                                        ? (MIC_FRAME_BYTES - frame_pos)
-                                        : (bytes - offset);
+        while (offset < bytes_read && s_input_session_active) {
+            const size_t copy_len = (MIC_FRAME_BYTES - frame_pos < bytes_read - offset)
+                                  ? (MIC_FRAME_BYTES - frame_pos)
+                                  : (bytes_read - offset);
             memcpy(frame_buffer + frame_pos, read_buffer + offset, copy_len);
             frame_pos += copy_len;
             offset += copy_len;
@@ -125,18 +199,9 @@ static void capture_task(void *arg)
             if (frame_pos != MIC_FRAME_BYTES) continue;
             frame_pos = 0;
 
-            if (!s_input_session_active) {
-                reset_tx_batch();
-                tx_speech_active = false;
-                vTaskDelay(1);
-                continue;
-            }
-
-            /* Keep the existing capture-side model-turn gate. */
             if (audio_engine_turn_active()) {
                 reset_tx_batch();
                 tx_speech_active = false;
-                vTaskDelay(1);
                 continue;
             }
 
@@ -155,15 +220,10 @@ static void capture_task(void *arg)
                 reset_tx_batch();
                 tx_speech_active = false;
                 flush_mic_tx_queue();
-                vTaskDelay(1);
-                continue;
+                break;
             }
 
-            /* Once speech starts, keep streaming for a bounded trailing silence
-             * window so Gemini server VAD can detect end-of-speech. Before speech
-             * and after this tail, silence is not put into the TX queue. */
-            if (tx_speech_active &&
-                s_last_activity_us != 0 &&
+            if (tx_speech_active && s_last_activity_us != 0 &&
                 now_us - s_last_activity_us >= (int64_t)MIC_VAD_HANGOVER_MS * 1000LL) {
                 tx_speech_active = false;
             }
@@ -174,9 +234,6 @@ static void capture_task(void *arg)
                 tx_batch_has_activity = true;
             }
 
-            /* If the VAD tail expired with a partial batch, pad the remainder
-             * with silence and send it. This avoids losing the final speech
-             * frames while keeping the WebSocket cadence at 1600 PCM bytes. */
             const bool tail_expired = !tx_speech_active && tx_batch_has_activity;
             if (tx_batch_pos == MIC_TX_BATCH_BYTES || tail_expired) {
                 if (s_tx_queue && s_mic_sink && tx_batch_has_activity &&
@@ -188,17 +245,14 @@ static void capture_task(void *arg)
                 }
                 reset_tx_batch();
             }
-
-            vTaskDelay(1);
         }
-    }
-}
 
-bool audio_engine_set_mic_listener(audio_engine_mic_frame_cb_t cb, void *ctx)
-{
-    s_mic_listener = cb;
-    s_mic_listener_ctx = ctx;
-    return true;
+        vTaskDelay(1);
+    }
+
+    s_capture_task = nullptr;
+    ESP_LOGI(TAG, "Conversation MIC owner STOP");
+    vTaskDelete(nullptr);
 }
 
 bool audio_engine_set_mic_sink(audio_engine_mic_sink_cb_t cb, void *ctx)
@@ -222,52 +276,131 @@ bool audio_engine_start_capture(void)
         return false;
     }
 
-    BaseType_t sink_rc = xTaskCreatePinnedToCore(
+    const BaseType_t sink_rc = xTaskCreatePinnedToCore(
         sink_task, "mic_tx", 4096, nullptr, 4, &s_sink_task, 0);
     if (sink_rc != pdPASS) {
         s_sink_task = nullptr;
         s_tx_queue = nullptr;
-        ESP_LOGE(TAG, "Gagal membuat MIC transport worker");
-        return false;
-    }
-
-    BaseType_t rc = xTaskCreatePinnedToCore(
-        capture_task, "audio_capture", 8192, nullptr, 5, &s_capture_task, 1);
-    if (rc != pdPASS) {
-        s_capture_task = nullptr;
-        s_sink_task = nullptr;
-        s_tx_queue = nullptr;
-        ESP_LOGE(TAG, "Gagal membuat AudioEngine capture task");
         return false;
     }
 
     s_capture_started = true;
+    s_wakeword_detected = false;
+    ESP_LOGI(TAG, "AudioEngine MIC subsystem READY; WakeWord is idle-mode MIC owner");
     return true;
+}
+
+bool audio_engine_start_wakeword(void)
+{
+    if (!s_capture_started) {
+        ESP_LOGE(TAG, "start_wakeword sebelum audio_engine_start_capture");
+        return false;
+    }
+    if (s_wakeword_running) return true;
+    if (s_input_session_active) {
+        ESP_LOGE(TAG, "Tidak bisa start WakeWord saat Gemini MIC aktif");
+        return false;
+    }
+
+    if (!wakeword_init()) {
+        ESP_LOGE(TAG, "WakeWord initialization failed");
+        return false;
+    }
+    if (wakeword_get_sample_rate() != 16000 || wakeword_get_chunk_samples() != 512) {
+        ESP_LOGE(TAG, "WakeWord configuration mismatch: rate=%d chunk=%d",
+                 wakeword_get_sample_rate(), wakeword_get_chunk_samples());
+        return false;
+    }
+
+    flush_mic_tx_queue();
+    s_wakeword_detected = false;
+
+    if (audio_hal_start_capture() != ESP_OK) {
+        ESP_LOGE(TAG, "Gagal start MIC capture untuk WakeWord");
+        return false;
+    }
+
+    s_wakeword_running = true;
+    const BaseType_t rc = xTaskCreate(
+        wakeword_task, "wakeword_task", WAKEWORD_TASK_STACK,
+        nullptr, WAKEWORD_TASK_PRIORITY, &s_wakeword_task);
+    if (rc != pdPASS) {
+        s_wakeword_running = false;
+        s_wakeword_task = nullptr;
+        (void)audio_hal_stop_capture();
+        ESP_LOGE(TAG, "Gagal membuat WakeWord task");
+        return false;
+    }
+
+    ESP_LOGI(TAG, "WakeWord capture START: AudioEngine -> Repo5 WakeWord engine");
+    return true;
+}
+
+void audio_engine_stop_wakeword(void)
+{
+    if (!s_wakeword_running && s_wakeword_task == nullptr) return;
+    (void)stop_wakeword_and_wait();
+    s_wakeword_detected = false;
+    ESP_LOGI(TAG, "WakeWord capture STOP: MIC released");
+}
+
+bool audio_engine_wakeword_detected(void)
+{
+    return s_wakeword_detected;
+}
+
+void audio_engine_clear_wakeword(void)
+{
+    s_wakeword_detected = false;
 }
 
 void audio_engine_start_input_session(void)
 {
     if (!s_capture_started) {
-        ESP_LOGW(TAG, "start_input_session sebelum capture aktif");
+        ESP_LOGW(TAG, "start_input_session sebelum capture subsystem aktif");
+        return;
+    }
+    if (s_input_session_active) return;
+
+    if (!stop_wakeword_and_wait()) return;
+    flush_mic_tx_queue();
+    s_last_activity_us = esp_timer_get_time();
+
+    if (audio_hal_start_capture() != ESP_OK) {
+        ESP_LOGE(TAG, "Gagal start MIC capture untuk Gemini");
         return;
     }
 
-    flush_mic_tx_queue();
-    s_last_activity_us = esp_timer_get_time();
     s_input_session_active = true;
-    ESP_LOGI(TAG, "MIC session START: AudioEngine -> transport");
+    const BaseType_t rc = xTaskCreatePinnedToCore(
+        conversation_task, "audio_capture", CONVERSATION_TASK_STACK,
+        nullptr, CONVERSATION_TASK_PRIORITY, &s_capture_task, 1);
+    if (rc != pdPASS) {
+        s_input_session_active = false;
+        s_capture_task = nullptr;
+        (void)audio_hal_stop_capture();
+        ESP_LOGE(TAG, "Gagal membuat Conversation MIC task");
+        return;
+    }
+
+    ESP_LOGI(TAG, "MIC session START: Gemini owns MIC; WakeWord stopped");
 }
 
 void audio_engine_stop_input_session(void)
 {
-    if (!s_input_session_active) {
+    if (!s_input_session_active && s_capture_task == nullptr) {
         flush_mic_tx_queue();
         return;
     }
 
     s_input_session_active = false;
+    (void)audio_hal_stop_capture();
+
+    for (uint32_t i = 0; i < 200 && s_capture_task != nullptr; ++i)
+        vTaskDelay(1);
+
     flush_mic_tx_queue();
-    ESP_LOGI(TAG, "MIC session STOP: AudioEngine");
+    ESP_LOGI(TAG, "MIC session STOP: Gemini released MIC");
 }
 
 bool audio_engine_input_session_active(void)
