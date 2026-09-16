@@ -45,7 +45,6 @@ typedef struct {
     size_t pending_bytes;
 } audio_engine_turn_t;
 
-typedef void (*audio_engine_mic_frame_cb_t)(const uint8_t *pcm, size_t len, void *ctx);
 typedef void (*audio_engine_mic_sink_cb_t)(const uint8_t *pcm, size_t len, void *ctx);
 
 /* One brain: AudioEngine owns the complete audio flow. */
@@ -60,10 +59,15 @@ void audio_engine_notify(audio_engine_event_type_t event, uint32_t generation);
 bool audio_engine_push_model_audio(const uint8_t *pcm, size_t len, uint32_t generation);
 bool audio_engine_push_model_audio_base64(const char *b64, size_t len, uint32_t generation);
 
-/* MIC -> AudioEngine -> listener/transport. */
-bool audio_engine_set_mic_listener(audio_engine_mic_frame_cb_t cb, void *ctx);
-bool audio_engine_set_mic_sink(audio_engine_mic_sink_cb_t cb, void *ctx);
+/* WakeWord owns MIC while the system is idle. */
 bool audio_engine_start_capture(void);
+bool audio_engine_start_wakeword(void);
+void audio_engine_stop_wakeword(void);
+bool audio_engine_wakeword_detected(void);
+void audio_engine_clear_wakeword(void);
+
+/* Gemini conversation owns MIC after setupComplete. */
+bool audio_engine_set_mic_sink(audio_engine_mic_sink_cb_t cb, void *ctx);
 void audio_engine_start_input_session(void);
 void audio_engine_stop_input_session(void);
 bool audio_engine_input_session_active(void);
