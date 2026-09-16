@@ -2,6 +2,7 @@
 
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
+#include "esp_err.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -36,5 +37,29 @@ void audio_i2s_test_tone(void);
 
 size_t audio_read_mic(uint8_t *dest, size_t max_len);
 
-
 size_t audio_write_speaker(const uint8_t *src, size_t len);
+
+// Repo5 WakeWord compatibility adapter.
+// Repo4 keeps the I2S RX channel enabled for the lifetime of Audio HAL;
+// ownership is controlled by AudioEngine task lifecycle, not by toggling
+// the I2S channel. These wrappers preserve the Repo5 engine interface
+// without introducing a second MIC implementation.
+static inline esp_err_t audio_hal_read_pcm(int16_t *dest, size_t max_samples, size_t *samples_read)
+{
+    if (!dest || !samples_read || max_samples == 0) return ESP_ERR_INVALID_ARG;
+    const size_t bytes = audio_read_mic(reinterpret_cast<uint8_t *>(dest), max_samples * sizeof(int16_t));
+    *samples_read = bytes / sizeof(int16_t);
+    return (*samples_read > 0) ? ESP_OK : ESP_FAIL;
+}
+
+static inline esp_err_t audio_hal_start_capture(void)
+{
+    // I2S RX is enabled by audio_hal_init(); WakeWord/Conversation tasks own reads.
+    return ESP_OK;
+}
+
+static inline esp_err_t audio_hal_stop_capture(void)
+{
+    // Capture remains enabled; the active owner task is stopped by AudioEngine.
+    return ESP_OK;
+}
