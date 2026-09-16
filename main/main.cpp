@@ -12,9 +12,6 @@
 #include "esp_wifi.h"
 #include "esp_psram.h"
 #include "esp_heap_caps.h"
-#include "esp_wn_iface.h"
-#include "esp_wn_models.h"
-#include "model_path.h"
 #include "driver/gpio.h"
 #include "esp_timer.h"
 
@@ -35,117 +32,24 @@
 
 static const char *TAG = "MAIN";
 static constexpr gpio_num_t BOOT_BUTTON_GPIO = GPIO_NUM_0;
-static constexpr char WAKE_MODEL_NAME[] = "wn9_hiesp";
-
-static srmodel_list_t *sr_models = nullptr;
-static const esp_wn_iface_t *wake_iface = nullptr;
-static model_iface_data_t *wake_model = nullptr;
-static int wake_chunk_samples = 0;
 
 static volatile bool assistant_active = false;
 static volatile bool wake_requested = false;
 static int reconnect_attempts = 0;
 static int64_t connect_start_us = 0;
 
-static bool wakeword_init(void)
+static bool ensure_wakeword_ready(void)
 {
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "ESP-SR WAKE WORD INIT");
-    ESP_LOGI(TAG, "Model: %s", WAKE_MODEL_NAME);
-
-    sr_models = esp_srmodel_init("model");
-    if (!sr_models) {
-        ESP_LOGE(TAG, "ESP-SR model loader gagal");
-        return false;
-    }
-    if (esp_srmodel_exists(sr_models, (char *)WAKE_MODEL_NAME) < 0) {
-        ESP_LOGE(TAG, "WakeNet model tidak ditemukan: %s", WAKE_MODEL_NAME);
-        esp_srmodel_deinit(sr_models);
-        sr_models = nullptr;
-        return false;
+    if (audio_engine_start_wakeword()) {
+        display_face_set_state(FACE_SLEEP);
+        display_text_set_status("Sistem siap. Katakan Hi, ESP...");
+        return true;
     }
 
-    wake_iface = esp_wn_handle_from_name(WAKE_MODEL_NAME);
-    if (!wake_iface) {
-        ESP_LOGE(TAG, "WakeNet handle tidak ditemukan: %s", WAKE_MODEL_NAME);
-        esp_srmodel_deinit(sr_models);
-        sr_models = nullptr;
-        return false;
-    }
-
-    ESP_LOGI(TAG, "WAKE HEAP: PSRAM free=%u largest=%u INTERNAL free=%u largest=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-
-    wake_model = wake_iface->create(WAKE_MODEL_NAME, DET_MODE_90);
-    if (!wake_model) {
-        ESP_LOGE(TAG, "Gagal membuat WakeNet model: %s", WAKE_MODEL_NAME);
-        wake_iface = nullptr;
-        esp_srmodel_deinit(sr_models);
-        sr_models = nullptr;
-        return false;
-    }
-
-    wake_chunk_samples = wake_iface->get_samp_chunksize(wake_model);
-    const int wake_rate = wake_iface->get_samp_rate(wake_model);
-    const int wake_channels = wake_iface->get_channel_num(wake_model);
-    ESP_LOGI(TAG, "WakeNet ready: rate=%dHz chunk=%d samples channels=%d",
-             wake_rate, wake_chunk_samples, wake_channels);
-
-    if (wake_rate != MIC_SAMPLE_RATE || wake_channels != 1) {
-        ESP_LOGE(TAG, "WakeNet audio mismatch: expected %dHz mono", MIC_SAMPLE_RATE);
-        wake_iface->destroy(wake_model);
-        wake_model = nullptr;
-        wake_iface = nullptr;
-        wake_chunk_samples = 0;
-        esp_srmodel_deinit(sr_models);
-        sr_models = nullptr;
-        return false;
-    }
-
-    ESP_LOGI(TAG, "Wake word aktif: HI, ESP");
-    return true;
-}
-
-static void wakeword_frame_cb(const uint8_t *pcm, size_t len, void *ctx)
-{
-    (void)ctx;
-    if (assistant_active || wake_requested || !wake_iface || !wake_model || wake_chunk_samples <= 0)
-        return;
-
-    static int16_t wake_buffer[1024];
-    static size_t wake_buffer_samples = 0;
-    const size_t incoming_samples = len / sizeof(int16_t);
-    const int16_t *samples = reinterpret_cast<const int16_t *>(pcm);
-
-    if (!samples || incoming_samples == 0) return;
-
-    if (wake_buffer_samples + incoming_samples > (sizeof(wake_buffer) / sizeof(wake_buffer[0]))) {
-        wake_buffer_samples = 0;
-    }
-
-    memcpy(wake_buffer + wake_buffer_samples, samples,
-           incoming_samples * sizeof(int16_t));
-    wake_buffer_samples += incoming_samples;
-
-    while (!assistant_active && !wake_requested &&
-           wake_buffer_samples >= (size_t)wake_chunk_samples) {
-        const int result = wake_iface->detect(wake_model, wake_buffer);
-        if (result > 0) {
-            ESP_LOGW(TAG, ">>> WAKE WORD TERDETEKSI: HI, ESP (id=%d)", result);
-            wake_requested = true;
-            wake_buffer_samples = 0;
-            return;
-        }
-
-        const size_t remainder = wake_buffer_samples - (size_t)wake_chunk_samples;
-        if (remainder > 0)
-            memmove(wake_buffer, wake_buffer + wake_chunk_samples,
-                    remainder * sizeof(int16_t));
-        wake_buffer_samples = remainder;
-    }
+    ESP_LOGE(TAG, "WakeWord start gagal");
+    display_face_set_state(FACE_ERROR);
+    display_text_set_status("WakeWord gagal!");
+    return false;
 }
 
 static void start_assistant_session(void)
@@ -156,9 +60,8 @@ static void start_assistant_session(void)
     reconnect_attempts = 0;
     connect_start_us = esp_timer_get_time();
 
-    /* WakeNet remains the MIC owner until Gemini setupComplete is ready.
-     * The supervisor activates the Gemini input session only after
-     * websocket_is_connected() becomes true. */
+    /* Repo5 ownership model: WakeWord owns MIC only while idle. Gemini gets
+     * exclusive MIC ownership after setupComplete through AudioEngine. */
     display_face_set_state(FACE_HAPPY);
     ESP_LOGI(TAG, "GEMINI_SESSION_START: menunggu WebSocket + setupComplete sebelum MIC TX");
     websocket_app_start();
@@ -177,6 +80,10 @@ static void app_supervisor_task(void *arg)
                 continue;
             }
 
+            if (!audio_engine_input_session_active()) {
+                (void)ensure_wakeword_ready();
+            }
+
             if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
                 vTaskDelay(pdMS_TO_TICKS(50));
                 if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
@@ -190,28 +97,24 @@ static void app_supervisor_task(void *arg)
             continue;
         }
 
-        /* Intentional Gemini standby is terminal for this session.
-         * Do not reconnect/resume until Wake Word starts a new session. */
         if (websocket_is_intentional_standby()) {
-            ESP_LOGI(TAG, "Gemini STANDBY: session selesai, menunggu Wake Word");
+            ESP_LOGI(TAG, "Gemini STANDBY: session selesai, mengembalikan WakeWord");
             assistant_active = false;
             wake_requested = false;
             audio_engine_stop_input_session();
-            display_face_set_state(FACE_SLEEP);
             reconnect_attempts = 0;
+            (void)ensure_wakeword_ready();
             vTaskDelay(pdMS_TO_TICKS(100));
             continue;
         }
 
-        /* Do not hand MIC TX to Gemini until the WebSocket transport has
-         * completed Gemini setup. WakeNet is logically paused while
-         * assistant_active is true, but AudioEngine keeps capture/framing
-         * running without enqueueing stale Gemini frames. */
+        /* Gemini gets the MIC only after WebSocket + setupComplete. */
         if (!audio_engine_input_session_active()) {
             if (websocket_is_connected()) {
                 ESP_LOGI(TAG, "GEMINI_SETUP_COMPLETE: handoff MIC -> Gemini");
                 audio_engine_start_input_session();
-                ESP_LOGI(TAG, "MIC_TX_READY: AudioEngine -> Gemini");
+                if (audio_engine_input_session_active())
+                    ESP_LOGI(TAG, "MIC_TX_READY: Gemini owns MIC");
                 vTaskDelay(pdMS_TO_TICKS(20));
                 continue;
             }
@@ -227,11 +130,11 @@ static void app_supervisor_task(void *arg)
                     websocket_app_start();
                     connect_start_us = esp_timer_get_time();
                 } else {
-                    ESP_LOGW(TAG, "Reconnect gagal, kembali ke mode sleep.");
+                    ESP_LOGW(TAG, "Reconnect gagal, kembali ke WakeWord.");
                     assistant_active = false;
                     audio_engine_stop_input_session();
-                    display_face_set_state(FACE_SLEEP);
                     reconnect_attempts = 0;
+                    (void)ensure_wakeword_ready();
                 }
             } else {
                 vTaskDelay(pdMS_TO_TICKS(100));
@@ -239,7 +142,6 @@ static void app_supervisor_task(void *arg)
             continue;
         }
 
-        /* AudioEngine owns the 60-second audio-idle decision. */
         if (!websocket_is_connected()) {
             if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) {
                 if (reconnect_attempts < 5) {
@@ -251,11 +153,11 @@ static void app_supervisor_task(void *arg)
                     websocket_app_start();
                     connect_start_us = esp_timer_get_time();
                 } else {
-                    ESP_LOGW(TAG, "Reconnect gagal, kembali ke mode sleep.");
+                    ESP_LOGW(TAG, "Reconnect gagal, kembali ke WakeWord.");
                     assistant_active = false;
                     audio_engine_stop_input_session();
-                    display_face_set_state(FACE_SLEEP);
                     reconnect_attempts = 0;
+                    (void)ensure_wakeword_ready();
                 }
             } else {
                 vTaskDelay(pdMS_TO_TICKS(100));
@@ -350,15 +252,17 @@ extern "C" void app_main()
     ESP_LOGI(TAG, "WiFi power save dimatikan");
     sync_sntp_time();
 
-    const bool wake_ready = wakeword_init();
-    if (!wake_ready) {
-        ESP_LOGE(TAG, "WakeNet init gagal. Sistem tetap bisa dimulai dengan tombol BOOT.");
-        display_text_set_status("WakeNet gagal!");
-    } else {
-        display_text_set_status("WakeNet siap. Katakan: Hi, ESP");
+    if (!audio_engine_start_capture()) {
+        ESP_LOGE(TAG, "AudioEngine capture subsystem gagal");
+        display_text_set_status("Mic Engine Gagal!");
+        display_face_set_state(FACE_ERROR);
+        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    audio_engine_set_mic_listener(wake_ready ? wakeword_frame_cb : nullptr, nullptr);
+    if (!ensure_wakeword_ready()) {
+        ESP_LOGE(TAG, "WakeWord belum READY - sistem tetap hidup untuk diagnostic");
+    }
+
     audio_engine_set_mic_sink(
         [](const uint8_t *pcm, size_t len, void *ctx) {
             (void)ctx;
@@ -366,23 +270,12 @@ extern "C" void app_main()
         },
         nullptr);
 
-    if (!audio_engine_start_capture()) {
-        ESP_LOGE(TAG, "AudioEngine capture gagal");
-        display_text_set_status("Mic Engine Gagal!");
-        display_face_set_state(FACE_ERROR);
-        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
-    display_text_set_status("WakeNet mendengar...");
-    display_face_set_state(FACE_SLEEP);
-    display_text_set_status("Sistem siap. Katakan Hi, ESP...");
-
     BaseType_t task_result = xTaskCreate(
         app_supervisor_task, "app_supervisor", 6144, nullptr, 5, nullptr);
     if (task_result != pdPASS)
         ESP_LOGE(TAG, "Gagal membuat app_supervisor task!");
     else
-        ESP_LOGI(TAG, "app_supervisor aktif; MIC dan framing sepenuhnya milik AudioEngine");
+        ESP_LOGI(TAG, "app_supervisor aktif; MIC ownership = WakeWord idle / Gemini active");
 
     while (1) vTaskDelay(pdMS_TO_TICKS(1000));
 }
