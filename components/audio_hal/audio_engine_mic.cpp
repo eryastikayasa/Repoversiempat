@@ -12,8 +12,10 @@
 static const char *TAG = "AUDIO_ENGINE_MIC";
 
 static constexpr size_t MIC_FRAME_BYTES = 320U; // 20 ms @ 16 kHz PCM16 mono
+static constexpr size_t MIC_TX_BATCH_BYTES = 1600U; // 100 ms, matching Repo3 WS transport cadence
 static constexpr size_t MIC_READ_BYTES = 4096U;
 static constexpr uint32_t MIC_IDLE_TIMEOUT_MS = 60000U;
+static constexpr uint32_t MIC_VAD_HANGOVER_MS = 500U;
 static constexpr int32_t MIC_ACTIVITY_THRESHOLD = 80;
 static constexpr size_t MIC_ACTIVITY_MIN_SAMPLES = 8U;
 static constexpr size_t MIC_TX_QUEUE_DEPTH = 16U;
@@ -29,7 +31,7 @@ static TaskHandle_t s_capture_task = nullptr;
 static TaskHandle_t s_sink_task = nullptr;
 
 static StaticQueue_t s_tx_queue_struct;
-static uint8_t s_tx_queue_storage[MIC_TX_QUEUE_DEPTH][MIC_FRAME_BYTES];
+static uint8_t s_tx_queue_storage[MIC_TX_QUEUE_DEPTH][MIC_TX_BATCH_BYTES];
 static QueueHandle_t s_tx_queue = nullptr;
 static uint32_t s_tx_queue_drops = 0;
 
@@ -57,25 +59,22 @@ static void flush_mic_tx_queue(void)
 static void sink_task(void *arg)
 {
     (void)arg;
-    uint8_t frame[MIC_FRAME_BYTES];
+    uint8_t batch[MIC_TX_BATCH_BYTES];
     ESP_LOGI(TAG, "Mic transport worker aktif; capture/WakeNet tidak mengerjakan TX");
 
     for (;;) {
-        if (xQueueReceive(s_tx_queue, frame, portMAX_DELAY) != pdTRUE)
+        if (xQueueReceive(s_tx_queue, batch, portMAX_DELAY) != pdTRUE)
             continue;
 
         audio_engine_mic_sink_cb_t sink = s_mic_sink;
         void *sink_ctx = s_mic_sink_ctx;
 
-        /*
-         * Repo3's audio_turn_active gate is preserved here as the second
-         * race-safe gate. A frame may already be queued when Gemini starts
-         * speaking; never transmit that stale frame during model playback.
-         */
+        /* Race-safe second gate: a batch can already be queued when Gemini
+         * starts speaking. Never transmit stale microphone audio in that turn. */
         if (!sink || !s_input_session_active || audio_engine_turn_active())
             continue;
 
-        sink(frame, MIC_FRAME_BYTES, sink_ctx);
+        sink(batch, MIC_TX_BATCH_BYTES, sink_ctx);
     }
 }
 
@@ -85,11 +84,15 @@ static void capture_task(void *arg)
 
     static uint8_t read_buffer[MIC_READ_BYTES];
     static uint8_t frame_buffer[MIC_FRAME_BYTES];
+    static uint8_t tx_batch[MIC_TX_BATCH_BYTES];
     size_t frame_pos = 0;
+    size_t tx_batch_pos = 0;
+    bool tx_batch_has_activity = false;
+    bool tx_speech_active = false;
 
-    ESP_LOGI(TAG, "Mic capture owner aktif: PCM16 16kHz, frame=%uB, read=%uB, idle=%ums, stack=8192",
-             (unsigned)MIC_FRAME_BYTES, (unsigned)MIC_READ_BYTES,
-             (unsigned)MIC_IDLE_TIMEOUT_MS);
+    ESP_LOGI(TAG, "Mic capture owner aktif: PCM16 16kHz, frame=%uB, TX batch=%uB, read=%uB, idle=%ums, stack=8192",
+             (unsigned)MIC_FRAME_BYTES, (unsigned)MIC_TX_BATCH_BYTES,
+             (unsigned)MIC_READ_BYTES, (unsigned)MIC_IDLE_TIMEOUT_MS);
 
     for (;;) {
         const size_t bytes = audio_read_mic(read_buffer, sizeof(read_buffer));
@@ -98,13 +101,7 @@ static void capture_task(void *arg)
             continue;
         }
 
-        /*
-         * WakeNet receives the same contiguous PCM read that comes out of
-         * the Audio HAL. This is intentionally closer to the proven
-         * Repoversitiga path: I2S/Audio HAL -> PCM buffer -> WakeNet detect.
-         * AudioEngine remains the single microphone owner; only the transport
-         * side is framed into 320-byte packets.
-         */
+        /* WakeNet receives the same contiguous PCM read produced by Audio HAL. */
         if (s_mic_listener)
             s_mic_listener(read_buffer, bytes, s_mic_listener_ctx);
 
@@ -121,52 +118,69 @@ static void capture_task(void *arg)
             frame_pos = 0;
 
             if (!s_input_session_active) {
-                /* Keep CPU1's idle task schedulable even during continuous capture. */
+                tx_batch_pos = 0;
+                tx_batch_has_activity = false;
+                tx_speech_active = false;
                 vTaskDelay(1);
                 continue;
             }
 
-            /*
-             * Do not queue microphone audio while Gemini is producing or
-             * draining a model turn. This is the Repo3 audio_turn_active
-             * behavior adapted to Repo4's AudioEngine state machine.
-             */
+            /* Keep the existing capture-side model-turn gate. */
             if (audio_engine_turn_active()) {
+                tx_batch_pos = 0;
+                tx_batch_has_activity = false;
+                tx_speech_active = false;
                 vTaskDelay(1);
                 continue;
             }
 
-            if (frame_has_activity(frame_buffer, MIC_FRAME_BYTES))
-                s_last_activity_us = esp_timer_get_time();
-
+            const bool active = frame_has_activity(frame_buffer, MIC_FRAME_BYTES);
             const int64_t now_us = esp_timer_get_time();
+            if (active) {
+                s_last_activity_us = now_us;
+                tx_speech_active = true;
+                tx_batch_has_activity = true;
+            }
+
             if (s_last_activity_us != 0 &&
                 now_us - s_last_activity_us >= (int64_t)MIC_IDLE_TIMEOUT_MS * 1000LL) {
                 ESP_LOGI(TAG, "Input idle %ums: AudioEngine mengakhiri sesi MIC",
                          (unsigned)MIC_IDLE_TIMEOUT_MS);
                 s_input_session_active = false;
+                tx_batch_pos = 0;
+                tx_batch_has_activity = false;
+                tx_speech_active = false;
                 flush_mic_tx_queue();
                 vTaskDelay(1);
                 continue;
             }
 
-            /*
-             * Never call the transport sink from the capture/WakeNet task.
-             * Only a fixed-size queue copy is performed here; malloc,
-             * memcpy into WebSocket buffers, and queue operations belonging
-             * to transport happen on the dedicated sink worker.
-             */
-            if (s_tx_queue && s_mic_sink) {
-                if (xQueueSend(s_tx_queue, frame_buffer, 0) != pdTRUE) {
-                    ++s_tx_queue_drops;
-                    if ((s_tx_queue_drops & 0x3FU) == 1U)
-                        ESP_LOGW(TAG, "MIC transport queue penuh; frame drop total=%u",
-                                 (unsigned)s_tx_queue_drops);
-                }
+            /* Preserve a short trailing silence window so Gemini's server VAD
+             * can observe end-of-speech. Repo4 no longer floods the TX queue
+             * with silence before speech or long after speech has ended. */
+            if (tx_speech_active &&
+                s_last_activity_us != 0 &&
+                now_us - s_last_activity_us >= (int64_t)MIC_VAD_HANGOVER_MS * 1000LL) {
+                tx_speech_active = false;
             }
 
-            /* One scheduler tick gives CPU1 IDLE a chance without moving any
-             * realtime audio work to another task. */
+            if (tx_speech_active || tx_batch_has_activity) {
+                memcpy(tx_batch + tx_batch_pos, frame_buffer, MIC_FRAME_BYTES);
+                tx_batch_pos += MIC_FRAME_BYTES;
+            }
+
+            if (tx_batch_pos == MIC_TX_BATCH_BYTES) {
+                if (s_tx_queue && s_mic_sink && tx_batch_has_activity &&
+                    xQueueSend(s_tx_queue, tx_batch, 0) != pdTRUE) {
+                    ++s_tx_queue_drops;
+                    if ((s_tx_queue_drops & 0x3FU) == 1U)
+                        ESP_LOGW(TAG, "MIC transport queue penuh; batch drop total=%u",
+                                 (unsigned)s_tx_queue_drops);
+                }
+                tx_batch_pos = 0;
+                tx_batch_has_activity = false;
+            }
+
             vTaskDelay(1);
         }
     }
@@ -192,7 +206,7 @@ bool audio_engine_start_capture(void)
 
     s_tx_queue = xQueueCreateStatic(
         MIC_TX_QUEUE_DEPTH,
-        MIC_FRAME_BYTES,
+        MIC_TX_BATCH_BYTES,
         &s_tx_queue_storage[0][0],
         &s_tx_queue_struct);
     if (!s_tx_queue) {
@@ -230,7 +244,6 @@ void audio_engine_start_input_session(void)
         return;
     }
 
-    /* Never carry pre-session microphone frames into a new Gemini turn. */
     flush_mic_tx_queue();
     s_last_activity_us = esp_timer_get_time();
     s_input_session_active = true;
