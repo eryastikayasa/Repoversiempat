@@ -48,6 +48,12 @@ static bool frame_has_activity(const uint8_t *data, size_t len)
     return false;
 }
 
+static void flush_mic_tx_queue(void)
+{
+    if (s_tx_queue)
+        (void)xQueueReset(s_tx_queue);
+}
+
 static void sink_task(void *arg)
 {
     (void)arg;
@@ -60,8 +66,16 @@ static void sink_task(void *arg)
 
         audio_engine_mic_sink_cb_t sink = s_mic_sink;
         void *sink_ctx = s_mic_sink_ctx;
-        if (sink && s_input_session_active)
-            sink(frame, MIC_FRAME_BYTES, sink_ctx);
+
+        /*
+         * Repo3's audio_turn_active gate is preserved here as the second
+         * race-safe gate. A frame may already be queued when Gemini starts
+         * speaking; never transmit that stale frame during model playback.
+         */
+        if (!sink || !s_input_session_active || audio_engine_turn_active())
+            continue;
+
+        sink(frame, MIC_FRAME_BYTES, sink_ctx);
     }
 }
 
@@ -112,6 +126,16 @@ static void capture_task(void *arg)
                 continue;
             }
 
+            /*
+             * Do not queue microphone audio while Gemini is producing or
+             * draining a model turn. This is the Repo3 audio_turn_active
+             * behavior adapted to Repo4's AudioEngine state machine.
+             */
+            if (audio_engine_turn_active()) {
+                vTaskDelay(1);
+                continue;
+            }
+
             if (frame_has_activity(frame_buffer, MIC_FRAME_BYTES))
                 s_last_activity_us = esp_timer_get_time();
 
@@ -121,6 +145,7 @@ static void capture_task(void *arg)
                 ESP_LOGI(TAG, "Input idle %ums: AudioEngine mengakhiri sesi MIC",
                          (unsigned)MIC_IDLE_TIMEOUT_MS);
                 s_input_session_active = false;
+                flush_mic_tx_queue();
                 vTaskDelay(1);
                 continue;
             }
@@ -204,6 +229,9 @@ void audio_engine_start_input_session(void)
         ESP_LOGW(TAG, "start_input_session sebelum capture aktif");
         return;
     }
+
+    /* Never carry pre-session microphone frames into a new Gemini turn. */
+    flush_mic_tx_queue();
     s_last_activity_us = esp_timer_get_time();
     s_input_session_active = true;
     ESP_LOGI(TAG, "MIC session START: AudioEngine -> transport");
@@ -211,8 +239,13 @@ void audio_engine_start_input_session(void)
 
 void audio_engine_stop_input_session(void)
 {
-    if (!s_input_session_active) return;
+    if (!s_input_session_active) {
+        flush_mic_tx_queue();
+        return;
+    }
+
     s_input_session_active = false;
+    flush_mic_tx_queue();
     ESP_LOGI(TAG, "MIC session STOP: AudioEngine");
 }
 
