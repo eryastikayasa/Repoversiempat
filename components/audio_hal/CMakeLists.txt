@@ -5,5 +5,5 @@ idf_component_register(
         "audio_engine_ingest.cpp"
         "audio_engine_mic.cpp"
     INCLUDE_DIRS "include"
-    REQUIRES esp_driver_gpio esp_driver_i2s esp-sr esp_timer display mbedtls
+    REQUIRES esp_driver_gpio esp_driver_i2s esp-sr esp_timer display mbedtls wakeword
 )
