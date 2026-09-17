@@ -1,30 +1,20 @@
 idf_component_register(
     SRCS
-        "websocket_mgr.cpp"
-        "websocket_events.cpp"
-        "websocket_rx_transport.cpp"
-        "websocket_rx_state.cpp"
-        "websocket_json.cpp"
-        "websocket_tx.cpp"
-        "websocket_tool.cpp"
-        "websocket_stack_wrap.c"
-
+        "websocket.cpp"
+        "websocket_transport.cpp"
+        "websocket_event.cpp"
+        "websocket_audio.cpp"
+        "gemini/gemini_protocol.cpp"
+        "gemini/gemini_message.cpp"
+        "gemini/gemini_audio.cpp"
     INCLUDE_DIRS
         "include"
-
+        "gemini"
+        "internal"
     REQUIRES
         esp_websocket_client
-        esp-tls
-        esp_event
         cjson
         mbedtls
-        display
-        audio_hal
-        wifi_manager
-        uart_control
         web_config
-)
-
-target_link_libraries(${COMPONENT_LIB} INTERFACE
-    "-Wl,--wrap=esp_websocket_client_init"
+        audio_engine
 )

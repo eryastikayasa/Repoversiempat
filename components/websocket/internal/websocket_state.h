@@ -1,0 +1,8 @@
+#pragma once
+
+typedef enum {
+    WEBSOCKET_STATE_DISCONNECTED = 0,
+    WEBSOCKET_STATE_CONNECTING,
+    WEBSOCKET_STATE_CONNECTED,
+    WEBSOCKET_STATE_ERROR
+} websocket_state_t;

@@ -1,345 +1,207 @@
+#include "web_config.h"
+#include "wifi_manager.h"
+
+#include "display_engine.h"
 #include "display_face.h"
 #include "display_text.h"
-#include "display_engine.h"
-#include "wifi_manager.h"
-#include "websocket_mgr.h"
-#include "audio_hal.h"
 #include "audio_engine.h"
-#include "uart_control.h"
-#include "web_config.h"
+#include "websocket.h"
+#include "websocket_audio.h"
+#include "websocket_event.h"
 
 #include "esp_log.h"
-#include "esp_wifi.h"
-#include "esp_psram.h"
-#include "esp_heap_caps.h"
-#include "esp_wn_iface.h"
-#include "esp_wn_models.h"
-#include "model_path.h"
+#include "esp_err.h"
+#include "nvs_flash.h"
 #include "driver/gpio.h"
-#include "esp_timer.h"
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
-#include "nvs_flash.h"
-#include "esp_sntp.h"
-
-#include <sys/time.h>
-#include <time.h>
-#include <string.h>
-#include <errno.h>
-#include <netdb.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-
 static const char *TAG = "MAIN";
 static constexpr gpio_num_t BOOT_BUTTON_GPIO = GPIO_NUM_0;
-static constexpr char WAKE_MODEL_NAME[] = "wn9_hiesp";
 
-static srmodel_list_t *sr_models = nullptr;
-static const esp_wn_iface_t *wake_iface = nullptr;
-static model_iface_data_t *wake_model = nullptr;
-static int wake_chunk_samples = 0;
-
-static volatile bool assistant_active = false;
-static volatile bool wake_requested = false;
-static int reconnect_attempts = 0;
-static int64_t connect_start_us = 0;
-
-static bool wakeword_init(void)
+static bool init_nvs(void)
 {
-    ESP_LOGI(TAG, "========================================");
-    ESP_LOGI(TAG, "ESP-SR WAKE WORD INIT");
-    ESP_LOGI(TAG, "Model: %s", WAKE_MODEL_NAME);
-
-    sr_models = esp_srmodel_init("model");
-    if (!sr_models) {
-        ESP_LOGE(TAG, "ESP-SR model loader gagal");
-        return false;
+    esp_err_t err = nvs_flash_init();
+    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "NVS perlu di-erase lalu init ulang");
+        err = nvs_flash_erase();
+        if (err != ESP_OK) return false;
+        err = nvs_flash_init();
     }
-    if (esp_srmodel_exists(sr_models, (char *)WAKE_MODEL_NAME) < 0) {
-        ESP_LOGE(TAG, "WakeNet model tidak ditemukan: %s", WAKE_MODEL_NAME);
-        esp_srmodel_deinit(sr_models);
-        sr_models = nullptr;
-        return false;
-    }
-
-    wake_iface = esp_wn_handle_from_name(WAKE_MODEL_NAME);
-    if (!wake_iface) {
-        ESP_LOGE(TAG, "WakeNet handle tidak ditemukan: %s", WAKE_MODEL_NAME);
-        esp_srmodel_deinit(sr_models);
-        sr_models = nullptr;
-        return false;
-    }
-
-    ESP_LOGI(TAG, "WAKE HEAP: PSRAM free=%u largest=%u INTERNAL free=%u largest=%u",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM),
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-
-    wake_model = wake_iface->create(WAKE_MODEL_NAME, DET_MODE_90);
-    if (!wake_model) {
-        ESP_LOGE(TAG, "Gagal membuat WakeNet model: %s", WAKE_MODEL_NAME);
-        wake_iface = nullptr;
-        esp_srmodel_deinit(sr_models);
-        sr_models = nullptr;
-        return false;
-    }
-
-    wake_chunk_samples = wake_iface->get_samp_chunksize(wake_model);
-    const int wake_rate = wake_iface->get_samp_rate(wake_model);
-    const int wake_channels = wake_iface->get_channel_num(wake_model);
-    ESP_LOGI(TAG, "WakeNet ready: rate=%dHz chunk=%d samples channels=%d",
-             wake_rate, wake_chunk_samples, wake_channels);
-
-    if (wake_rate != MIC_SAMPLE_RATE || wake_channels != 1) {
-        ESP_LOGE(TAG, "WakeNet audio mismatch: expected %dHz mono", MIC_SAMPLE_RATE);
-        wake_iface->destroy(wake_model);
-        wake_model = nullptr;
-        wake_iface = nullptr;
-        wake_chunk_samples = 0;
-        esp_srmodel_deinit(sr_models);
-        sr_models = nullptr;
-        return false;
-    }
-
-    ESP_LOGI(TAG, "Wake word aktif: HI, ESP");
+    if (err != ESP_OK) return false;
+    ESP_LOGI(TAG, "NVS READY");
     return true;
 }
 
-static void wakeword_frame_cb(const uint8_t *pcm, size_t len, void *ctx)
+static void init_display(void)
 {
-    (void)ctx;
-    if (assistant_active || wake_requested || !wake_iface || !wake_model || wake_chunk_samples <= 0)
-        return;
-
-    static int16_t wake_buffer[1024];
-    static size_t wake_buffer_samples = 0;
-    const size_t incoming_samples = len / sizeof(int16_t);
-    const int16_t *samples = reinterpret_cast<const int16_t *>(pcm);
-
-    if (!samples || incoming_samples == 0) return;
-
-    if (wake_buffer_samples + incoming_samples > (sizeof(wake_buffer) / sizeof(wake_buffer[0]))) {
-        wake_buffer_samples = 0;
-    }
-
-    memcpy(wake_buffer + wake_buffer_samples, samples,
-           incoming_samples * sizeof(int16_t));
-    wake_buffer_samples += incoming_samples;
-
-    while (!assistant_active && !wake_requested &&
-           wake_buffer_samples >= (size_t)wake_chunk_samples) {
-        const int result = wake_iface->detect(wake_model, wake_buffer);
-        if (result > 0) {
-            ESP_LOGW(TAG, ">>> WAKE WORD TERDETEKSI: HI, ESP (id=%d)", result);
-            wake_requested = true;
-            wake_buffer_samples = 0;
-            return;
-        }
-
-        const size_t remainder = wake_buffer_samples - (size_t)wake_chunk_samples;
-        if (remainder > 0)
-            memmove(wake_buffer, wake_buffer + wake_chunk_samples,
-                    remainder * sizeof(int16_t));
-        wake_buffer_samples = remainder;
-    }
-}
-
-static void start_assistant_session(void)
-{
-    if (assistant_active) return;
-    assistant_active = true;
-    wake_requested = false;
-    reconnect_attempts = 0;
-    connect_start_us = esp_timer_get_time();
-    audio_engine_start_input_session();
-    display_face_set_state(FACE_HAPPY);
-    websocket_app_start();
-}
-
-static void app_supervisor_task(void *arg)
-{
-    (void)arg;
-
-    for (;;) {
-        if (!assistant_active) {
-            if (wake_requested) {
-                ESP_LOGI(TAG, "Wake request diterima supervisor. Memulai sesi...");
-                start_assistant_session();
-                vTaskDelay(pdMS_TO_TICKS(20));
-                continue;
-            }
-
-            if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
-                vTaskDelay(pdMS_TO_TICKS(50));
-                if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
-                    while (gpio_get_level(BOOT_BUTTON_GPIO) == 0)
-                        vTaskDelay(pdMS_TO_TICKS(10));
-                    ESP_LOGI(TAG, "Tombol ditekan! Memulai sesi...");
-                    start_assistant_session();
-                }
-            }
-            vTaskDelay(pdMS_TO_TICKS(20));
-            continue;
-        }
-
-        /* AudioEngine owns the 60-second audio-idle decision. */
-        if (!audio_engine_input_session_active()) {
-            ESP_LOGI(TAG, "AudioEngine mengakhiri sesi MIC");
-            assistant_active = false;
-            websocket_disconnect();
-            display_face_set_state(FACE_SLEEP);
-            reconnect_attempts = 0;
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        if (!websocket_is_connected()) {
-            if (esp_timer_get_time() - connect_start_us > 15 * 1000000LL) {
-                if (reconnect_attempts < 5) {
-                    const int delay_sec = 2 << reconnect_attempts;
-                    ++reconnect_attempts;
-                    ESP_LOGW(TAG, "Reconnect attempt %d in %d sec...",
-                             reconnect_attempts, delay_sec);
-                    vTaskDelay(pdMS_TO_TICKS(delay_sec * 1000));
-                    websocket_app_start();
-                    connect_start_us = esp_timer_get_time();
-                } else {
-                    ESP_LOGW(TAG, "Reconnect gagal, kembali ke mode sleep.");
-                    assistant_active = false;
-                    audio_engine_stop_input_session();
-                    display_face_set_state(FACE_SLEEP);
-                    reconnect_attempts = 0;
-                }
-            } else {
-                vTaskDelay(pdMS_TO_TICKS(100));
-            }
-            continue;
-        }
-
-        vTaskDelay(pdMS_TO_TICKS(20));
-    }
-}
-
-static void sync_sntp_time(void)
-{
-    ESP_LOGI(TAG, "Mencari server NTP...");
-    display_text_set_status("Sync Jam Network..");
-    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
-    esp_sntp_setservername(0, "time.google.com");
-    esp_sntp_setservername(1, "id.pool.ntp.org");
-    esp_sntp_setservername(2, "pool.ntp.org");
-    esp_sntp_init();
-
-    int retry = 0;
-    time_t now = 0;
-    struct tm timeinfo = {};
-    while (retry++ < 10) {
-        time(&now);
-        localtime_r(&now, &timeinfo);
-        if (timeinfo.tm_year >= (2024 - 1900)) {
-            ESP_LOGI(TAG, "Waktu cocok! Tahun: %d", timeinfo.tm_year + 1900);
-            display_text_set_status("Jam Cocok!");
-            vTaskDelay(pdMS_TO_TICKS(1000));
-            return;
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
-
-    ESP_LOGW(TAG, "NTP gagal. Menggunakan waktu fallback.");
-    struct timeval tv = { .tv_sec = 1770000000, .tv_usec = 0 };
-    settimeofday(&tv, NULL);
-    display_text_set_status("Jam Set Fallback");
-}
-
-extern "C" void app_main()
-{
-    ESP_LOGI(TAG, "Total PSRAM: %d bytes", esp_psram_get_size());
-    ESP_LOGI(TAG, "Free Heap: %d bytes", esp_get_free_heap_size());
-    ESP_LOGI(TAG, "Free PSRAM: %d bytes", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
-    ESP_LOGI(TAG, "ESP32-S3 Asisten Kamar Dimulai...");
-
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    if (web_config_is_needed()) {
-        display_text_set_status("Config Mode");
-        web_config_start();
-        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
-    }
-
     display_face_init();
     display_text_init();
+    display_text_set_status("Memulai...");
     display_engine_init();
     display_engine_start();
-    display_face_set_state(FACE_SLEEP);
-    display_text_set_status("Booting...");
+    ESP_LOGI(TAG, "DISPLAY READY");
+}
 
-    audio_hal_init();
-    if (!audio_engine_init()) {
-        ESP_LOGE(TAG, "AudioEngine init gagal");
-        display_text_set_status("Audio Engine Gagal!");
+static bool init_boot_button(void)
+{
+    gpio_config_t io = {};
+    io.pin_bit_mask = 1ULL << BOOT_BUTTON_GPIO;
+    io.mode = GPIO_MODE_INPUT;
+    io.pull_up_en = GPIO_PULLUP_ENABLE;
+    io.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io.intr_type = GPIO_INTR_DISABLE;
+    const esp_err_t err = gpio_config(&io);
+    if (err != ESP_OK) return false;
+    ESP_LOGI(TAG, "BOOT button READY: GPIO0, tekan untuk memulai sesi Gemini");
+    return true;
+}
+
+static bool init_wakeword(void)
+{
+    if (!audio_engine_init()) return false;
+    if (!audio_engine_start_wakeword()) {
+        audio_engine_stop();
+        return false;
+    }
+    display_face_set_state(FACE_IDLE);
+    display_text_set_status("Siap - ucap HI ESP");
+    ESP_LOGI(TAG, "WAKEWORD READY - menunggu HI, ESP / BOOT");
+    return true;
+}
+
+static bool init_websocket(void)
+{
+    const esp_err_t err = websocket_init();
+    if (err != ESP_OK) return false;
+    ESP_LOGI(TAG, "WEBSOCKET READY - menunggu WakeWord / BOOT");
+    return true;
+}
+
+static bool restart_wakeword_after_conversation_failure(void)
+{
+    websocket_disconnect();
+    if (!audio_engine_start_wakeword()) {
         display_face_set_state(FACE_ERROR);
-        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+        display_text_set_status("WakeWord gagal");
+        return false;
+    }
+    display_face_set_state(FACE_IDLE);
+    display_text_set_status("Siap - ucap HI ESP");
+    return true;
+}
+
+static bool start_conversation(void)
+{
+    display_face_set_state(FACE_LISTENING);
+    display_text_set_status("Menghubungkan Gemini...");
+
+    const esp_err_t ws_err = websocket_connect();
+    if (ws_err != ESP_OK) {
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("Gemini gagal");
+        restart_wakeword_after_conversation_failure();
+        return false;
     }
 
-    gpio_set_direction(BOOT_BUTTON_GPIO, GPIO_MODE_INPUT);
-    gpio_set_pull_mode(BOOT_BUTTON_GPIO, GPIO_PULLUP_ONLY);
-    uart_control_init();
+    const TickType_t deadline = xTaskGetTickCount() + pdMS_TO_TICKS(15000);
+    while (!websocket_event_gemini_ready()) {
+        if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
+            display_face_set_state(FACE_ERROR);
+            display_text_set_status("Gemini timeout");
+            restart_wakeword_after_conversation_failure();
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 
-    display_text_set_status("Menghubungkan WiFi...");
+    display_text_set_status("Mendengarkan...");
+    if (!audio_engine_start_conversation()) {
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("Audio gagal");
+        restart_wakeword_after_conversation_failure();
+        return false;
+    }
+
+    if (!websocket_audio_start()) {
+        audio_engine_stop_conversation();
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("Uplink gagal");
+        restart_wakeword_after_conversation_failure();
+        return false;
+    }
+
+    ESP_LOGI(TAG, "CONVERSATION START: AudioEngine -> WebSocket -> Gemini");
+    return true;
+}
+
+extern "C" void app_main(void)
+{
+    ESP_LOGI(TAG, "========================================");
+    ESP_LOGI(TAG, "ESP32-S3 application start");
+    ESP_LOGI(TAG, "========================================");
+
+    if (!init_nvs()) {
+        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    if (web_config_is_needed()) {
+        ESP_LOGW(TAG, "Konfigurasi belum siap - masuk WebConfig");
+        web_config_start();
+        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+
+    ESP_LOGI(TAG, "Konfigurasi ditemukan - lanjut Wi-Fi");
+    init_display();
+    display_text_set_status("WiFi...");
     wifi_init_sta();
-    if (!wifi_wait_for_connection(15000)) {
-        ESP_LOGE(TAG, "Wi-Fi tidak mendapatkan IP.");
-        display_text_set_status("WiFi Gagal!");
+
+    if (!wifi_wait_for_connection(30000)) {
         display_face_set_state(FACE_ERROR);
-        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+        display_text_set_status("WiFi gagal");
+        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    esp_wifi_set_ps(WIFI_PS_NONE);
-    ESP_LOGI(TAG, "WiFi power save dimatikan");
-    sync_sntp_time();
+    display_face_set_state(FACE_IDLE);
+    display_text_set_status("WiFi OK");
+    ESP_LOGI(TAG, "WIFI READY");
 
-    const bool wake_ready = wakeword_init();
-    if (!wake_ready) {
-        ESP_LOGE(TAG, "WakeNet init gagal. Sistem tetap bisa dimulai dengan tombol BOOT.");
-        display_text_set_status("WakeNet gagal!");
-    } else {
-        display_text_set_status("WakeNet siap. Katakan: Hi, ESP");
-    }
-
-    audio_engine_set_mic_listener(wake_ready ? wakeword_frame_cb : nullptr, nullptr);
-    audio_engine_set_mic_sink(
-        [](const uint8_t *pcm, size_t len, void *ctx) {
-            (void)ctx;
-            websocket_send_audio_data(pcm, len);
-        },
-        nullptr);
-
-    if (!audio_engine_start_capture()) {
-        ESP_LOGE(TAG, "AudioEngine capture gagal");
-        display_text_set_status("Mic Engine Gagal!");
+    if (!init_websocket()) {
         display_face_set_state(FACE_ERROR);
-        while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+        display_text_set_status("WebSocket gagal");
+        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    display_text_set_status("WakeNet mendengar...");
-    display_face_set_state(FACE_SLEEP);
-    display_text_set_status("Sistem siap. Katakan Hi, ESP...");
+    if (!init_boot_button()) {
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("BOOT gagal");
+        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
-    BaseType_t task_result = xTaskCreate(
-        app_supervisor_task, "app_supervisor", 6144, nullptr, 5, nullptr);
-    if (task_result != pdPASS)
-        ESP_LOGE(TAG, "Gagal membuat app_supervisor task!");
-    else
-        ESP_LOGI(TAG, "app_supervisor aktif; MIC dan framing sepenuhnya milik AudioEngine");
+    if (!init_wakeword()) {
+        display_face_set_state(FACE_ERROR);
+        display_text_set_status("WakeWord gagal");
+        while (true) vTaskDelay(pdMS_TO_TICKS(1000));
+    }
 
-    while (1) vTaskDelay(pdMS_TO_TICKS(1000));
+    bool boot_button_down = (gpio_get_level(BOOT_BUTTON_GPIO) == 0);
+    while (true) {
+        const bool boot_pressed = (gpio_get_level(BOOT_BUTTON_GPIO) == 0);
+        if (boot_pressed && !boot_button_down) {
+            vTaskDelay(pdMS_TO_TICKS(30));
+            if (gpio_get_level(BOOT_BUTTON_GPIO) == 0) {
+                if (start_conversation()) ESP_LOGI(TAG, "MAIN: conversation mode ACTIVE (BOOT)");
+                boot_button_down = true;
+            }
+        } else if (!boot_pressed) {
+            boot_button_down = false;
+        }
+
+        if (audio_engine_wakeword_detected()) {
+            ESP_LOGI(TAG, "MAIN: WakeWord event");
+            audio_engine_clear_wakeword();
+            if (start_conversation()) ESP_LOGI(TAG, "MAIN: conversation mode ACTIVE (WakeWord)");
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
 }
