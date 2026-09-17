@@ -1,53 +1,109 @@
 #include "display_engine.h"
+
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_timer.h"
 #include "esp_attr.h"
+#include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "display_face.h"
 #include "display_text.h"
 #include "display_driver.h"
 
 namespace {
-constexpr uint32_t FRAME_MS = 50;
-constexpr size_t FB_SIZE = 128 * 64 / 8;
-constexpr uint32_t STACK = 4096;
-static EXT_RAM_BSS_ATTR uint8_t s_final[FB_SIZE] = {0};
-static TaskHandle_t s_task = nullptr;
-static volatile bool s_running = false;
-static bool s_initialized = false;
+constexpr int DISPLAY_ENGINE_FRAME_MS = 50;
+constexpr int DISPLAY_ENGINE_WIDTH = DISPLAY_DRIVER_WIDTH;
+constexpr int DISPLAY_ENGINE_HEIGHT = DISPLAY_DRIVER_HEIGHT;
+constexpr size_t DISPLAY_FRAMEBUFFER_SIZE = (size_t)DISPLAY_ENGINE_WIDTH * (size_t)DISPLAY_ENGINE_HEIGHT / 8U;
+constexpr uint32_t DISPLAY_ENGINE_STACK = 4096U;
+constexpr UBaseType_t DISPLAY_ENGINE_PRIORITY = 3U;
+constexpr BaseType_t DISPLAY_ENGINE_CORE = 1;
 static const char *TAG = "DISPLAY_ENGINE";
+static EXT_RAM_BSS_ATTR uint8_t s_final_buffer[DISPLAY_FRAMEBUFFER_SIZE] = {0};
+static TaskHandle_t s_display_engine_task = nullptr;
+static bool s_initialized = false;
+static volatile bool s_running = false;
 
-static void compose()
+static void clear_final_frame(void) { memset(s_final_buffer, 0, sizeof(s_final_buffer)); }
+
+static void overlay_text_buffer(void)
+{
+    const uint8_t *text = display_text_buffer();
+    if (!text) return;
+    for (size_t i = 0; i < sizeof(s_final_buffer); ++i) s_final_buffer[i] |= text[i];
+}
+
+static void update_text_layer(void)
+{
+    const face_state_t state = display_face_get_state();
+    switch (state) {
+        case FACE_LISTENING:
+        case FACE_THINKING:
+            if (display_text_has_user()) display_text_render_user();
+            else display_text_render_status();
+            break;
+        case FACE_SPEAKING:
+            if (display_text_has_gemini()) display_text_render_gemini();
+            else if (display_text_has_user()) display_text_render_user();
+            else display_text_render_status();
+            break;
+        default:
+            if (display_text_has_user()) display_text_render_user();
+            else if (display_text_has_gemini()) display_text_render_gemini();
+            else display_text_render_status();
+            break;
+    }
+}
+
+static void compose_frame(void)
 {
     const uint8_t *face = display_face_buffer();
-    const uint8_t *text = display_text_buffer();
-    memset(s_final, 0, sizeof(s_final));
-    if (face) memcpy(s_final, face, sizeof(s_final));
-    if (text) for (size_t i = 0; i < sizeof(s_final); ++i) s_final[i] |= text[i];
+    clear_final_frame();
+    if (face) memcpy(s_final_buffer, face, sizeof(s_final_buffer));
+    overlay_text_buffer();
 }
 
-static void render_text_layer()
+static void log_display_audit(const char *stage)
 {
-    if (display_text_has_gemini()) display_text_render_gemini();
-    else if (display_text_has_user()) display_text_render_user();
-    else display_text_render_status();
-}
-
-static void task(void *)
-{
-    TickType_t last = xTaskGetTickCount();
-    ESP_LOGI(TAG, "Display task: 128x64 framebuffer=%uB PSRAM frame=%ums (~20 FPS) priority=3 core=1", (unsigned)FB_SIZE, (unsigned)FRAME_MS);
-    while (s_running) {
-        const uint32_t now = (uint32_t)(esp_timer_get_time() / 1000ULL);
-        display_face_update(now);
-        display_text_update(now);
-        render_text_layer();
-        compose();
-        display_driver_present(s_final, 128, 64);
-        vTaskDelayUntil(&last, pdMS_TO_TICKS(FRAME_MS));
+    const size_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t internal_largest = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+    const size_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    const size_t psram_largest = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (s_display_engine_task) {
+        ESP_LOGI(TAG, "TASK AUDIT display_engine stack=%uB watermark=%uB priority=%u core=%d",
+                 (unsigned)DISPLAY_ENGINE_STACK,
+                 (unsigned)(uxTaskGetStackHighWaterMark(s_display_engine_task) * sizeof(StackType_t)),
+                 (unsigned)uxTaskPriorityGet(s_display_engine_task),
+                 (int)xTaskGetCoreID(s_display_engine_task));
     }
-    s_task = nullptr;
+    ESP_LOGI(TAG, "RAM AUDIT[%s] internal_free=%u internal_largest=%u psram_free=%u psram_largest=%u framebuffer=%uB PSRAM",
+             stage ? stage : "unknown", (unsigned)internal_free, (unsigned)internal_largest,
+             (unsigned)psram_free, (unsigned)psram_largest, (unsigned)DISPLAY_FRAMEBUFFER_SIZE);
+}
+
+static void display_engine_task(void *)
+{
+    TickType_t last_wake = xTaskGetTickCount();
+    int64_t last_audit_us = 0;
+    ESP_LOGI(TAG, "Display task: %dx%d framebuffer=%uB PSRAM frame=%ums priority=%u core=%d",
+             DISPLAY_ENGINE_WIDTH, DISPLAY_ENGINE_HEIGHT, (unsigned)DISPLAY_FRAMEBUFFER_SIZE,
+             (unsigned)DISPLAY_ENGINE_FRAME_MS, (unsigned)DISPLAY_ENGINE_PRIORITY, (int)DISPLAY_ENGINE_CORE);
+    while (s_running) {
+        const uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000ULL);
+        display_face_update(now_ms);
+        display_text_update(now_ms);
+        update_text_layer();
+        compose_frame();
+        display_driver_present(s_final_buffer, DISPLAY_ENGINE_WIDTH, DISPLAY_ENGINE_HEIGHT);
+        const int64_t now_us = esp_timer_get_time();
+        if (!last_audit_us || now_us - last_audit_us >= 10000000LL) {
+            last_audit_us = now_us;
+            log_display_audit("runtime");
+        }
+        vTaskDelayUntil(&last_wake, pdMS_TO_TICKS(DISPLAY_ENGINE_FRAME_MS));
+    }
+    s_display_engine_task = nullptr;
     vTaskDelete(nullptr);
 }
 }
@@ -55,41 +111,30 @@ static void task(void *)
 void display_engine_init(void)
 {
     if (s_initialized) return;
+    clear_final_frame();
     display_driver_init();
-    display_face_init();
-    display_text_init();
     s_initialized = true;
 }
 
 void display_engine_start(void)
 {
     if (!s_initialized) display_engine_init();
-    if (s_running || s_task) return;
+    if (s_running || s_display_engine_task) return;
     s_running = true;
-    if (xTaskCreatePinnedToCore(task, "display_engine", STACK, nullptr, 3, &s_task, 1) != pdPASS) {
+    BaseType_t result = xTaskCreatePinnedToCore(display_engine_task, "display_engine", DISPLAY_ENGINE_STACK,
+                                                nullptr, DISPLAY_ENGINE_PRIORITY, &s_display_engine_task,
+                                                DISPLAY_ENGINE_CORE);
+    if (result != pdPASS) {
         s_running = false;
-        s_task = nullptr;
-        ESP_LOGE(TAG, "Display engine task create gagal");
+        s_display_engine_task = nullptr;
+        ESP_LOGE(TAG, "Display task create gagal");
     }
 }
 
-void display_engine_stop(void)
-{
-    s_running = false;
-}
-
-void display_set_face_state(face_state_t face)
-{
-    display_face_set_state(face);
-}
-
-void display_set_status(const char *status)
-{
-    display_text_set_status(status ? status : "");
-}
+void display_engine_stop(void) { s_running = false; }
 
 void display_set_system_state(face_state_t face, const char *status)
 {
-    display_set_face_state(face);
-    display_set_status(status);
+    display_face_set_state(face);
+    display_text_set_status(status ? status : "");
 }
