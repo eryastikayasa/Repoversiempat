@@ -16,10 +16,11 @@ static const char *TAG = "WS_MGR";
 static constexpr size_t WS_TX_AUDIO_SIZE = 3200;
 static constexpr size_t WS_TX_TEXT_SIZE = 8192;
 static constexpr size_t WS_TX_QUEUE_LENGTH = 3;
-static constexpr size_t PCM_SEND_CHUNK = 1600;
-static constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
-static constexpr TickType_t AUDIO_SEND_RETRY_DELAY = pdMS_TO_TICKS(30);
-static constexpr int AUDIO_SEND_RETRIES = 1;
+// Keep the websocket critical section short. Repo3 uses 512-byte PCM chunks.
+static constexpr size_t PCM_SEND_CHUNK = 512;
+static constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(50);
+static constexpr TickType_t AUDIO_SEND_RETRY_DELAY = pdMS_TO_TICKS(20);
+static constexpr int AUDIO_SEND_RETRIES = 5;
 static constexpr uint32_t TX_TASK_STACK = 8192;
 static constexpr UBaseType_t TX_TASK_PRIORITY = 4;
 
@@ -44,7 +45,8 @@ static bool send_text_checked(esp_websocket_client_handle_t ws, const char *text
 static void websocket_tx_task(void *)
 {
     ws_tx_command_t cmd{};
-    static char b64_buf[2300]; static char json_buf[2500];
+    static char b64_buf[1024];
+    static char json_buf[1400];
     for (;;) {
         if (xQueueReceive(s_tx_queue, &cmd, portMAX_DELAY) != pdTRUE) continue;
         uint8_t *data = cmd.data; cmd.data = nullptr;
@@ -67,7 +69,8 @@ static void websocket_tx_task(void *)
             size_t offset = 0; bool failed = false;
             while (offset < cmd.len) {
                 if (!tx_state_valid(cmd.generation) || websocket_transport_get_client() != ws || !esp_websocket_client_is_connected(ws)) { failed = true; break; }
-                size_t chunk_len = cmd.len - offset; if (chunk_len > PCM_SEND_CHUNK) chunk_len = PCM_SEND_CHUNK;
+                size_t chunk_len = cmd.len - offset;
+                if (chunk_len > PCM_SEND_CHUNK) chunk_len = PCM_SEND_CHUNK;
                 size_t encoded_len = 0;
                 if (mbedtls_base64_encode((unsigned char *)b64_buf, sizeof(b64_buf)-1, &encoded_len, data+offset, chunk_len) != 0) { failed=true; break; }
                 b64_buf[encoded_len]='\0';
@@ -76,7 +79,7 @@ static void websocket_tx_task(void *)
                 bool sent_ok=false;
                 for (int attempt=0; attempt<=AUDIO_SEND_RETRIES; ++attempt) {
                     if (attempt>0) vTaskDelay(AUDIO_SEND_RETRY_DELAY);
-                    if (!tx_state_valid(cmd.generation)) break;
+                    if (!tx_state_valid(cmd.generation) || websocket_transport_get_client() != ws || !esp_websocket_client_is_connected(ws)) break;
                     if (esp_websocket_client_send_text(ws,json_buf,json_len,AUDIO_SEND_TIMEOUT)==json_len) { sent_ok=true; break; }
                 }
                 if (!sent_ok) { failed=true; break; }
