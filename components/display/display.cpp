@@ -1,26 +1,25 @@
 #include "display.h"
 #include "display_driver.h"
 #include "display_face.h"
-#include "esp_log.h"
-
-static const char *TAG = "DISPLAY";
+#include "display_text.h"
+#include "display_engine.h"
 
 void oled_init(void)
 {
-    display_driver_init();
-    display_face_init();
+    display_engine_init();
+    display_engine_start();
 }
 
 void display_render_buffer(const uint8_t *buffer)
 {
-    if (!buffer) return;
-    display_driver_present(buffer, OLED_WIDTH, OLED_HEIGHT);
+    // Legacy API retained for compatibility. The display engine owns the final
+    // OLED presentation; callers may not bypass the compositor anymore.
+    (void)buffer;
 }
 
 void display_status(const char *text)
 {
-    if (!display_driver_is_ready()) display_driver_init();
-    ESP_LOGI(TAG, "[OLED STATUS]: %s", text ? text : "(null)");
+    display_text_set_status(text ? text : "");
 }
 
 void face_set_state(face_state_t state)
@@ -36,21 +35,15 @@ face_state_t face_get_state(void)
 void display_render_mochi_gaze(int expr, int step, int sX, int sY,
                                int gaze_x, int gaze_y)
 {
-    if (!display_driver_is_ready()) display_driver_init();
     display_face_render_mochi_gaze(expr, step, sX, sY, gaze_x, gaze_y, 0, 0);
-    display_driver_present(display_face_buffer(), OLED_WIDTH, OLED_HEIGHT);
 }
 
 void display_render_mochi(int expr, int step, int sX, int sY, int arahLirik)
 {
-    if (!display_driver_is_ready()) display_driver_init();
     display_face_render_mochi(expr, step, sX, sY, arahLirik);
-    display_driver_present(display_face_buffer(), OLED_WIDTH, OLED_HEIGHT);
 }
 
 void face_render(void)
 {
-    if (!display_driver_is_ready()) display_driver_init();
     display_face_render();
-    display_driver_present(display_face_buffer(), OLED_WIDTH, OLED_HEIGHT);
 }
