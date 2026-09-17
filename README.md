@@ -1,16 +1,12 @@
+# Repoversilima
 
-🏠 ESP32-S3 Asisten Kamar
-Voice Commander berbasis ESP32-S3, terhubung ke ESP32 DevKit V1 sebagai IR Master & Relay, dengan Gemini Live API melalui WebSocket Secure.
+Clean rebuild of the ESP32-S3 voice firmware.
 
+Repo 4 (`Repoversiempat`) is reference only. Repo 5 is intentionally rebuilt from a small foundation.
 
+Target architecture:
 
-🔌 Arsitektur Hardware
-[ Mikrofon INMP441 ] ---> [ ESP32-S3 (Voice Commander) ]
-                                │
-                                │ UART / Serial1
-                                ▼
-                      [ ESP32 DevKit V1 (IR Master & Relay) ]
-                                │
-              ┌─────────────────┼─────────────────┬──────────┐
-              ▼                 ▼                 ▼                      ▼
-         [ Relay 4CH ]    [ IR Remote ]    [ DFPlayer                  / Mochi ]        [  Kipas ]
+MIC → Audio HAL → Audio Engine → WebSocket → Gemini
+Gemini → WebSocket → Audio Engine → Audio HAL → Speaker
+
+WebSocket is transport only. Audio logic belongs to the audio layer.
