@@ -12,5 +12,5 @@ idf_component_register(
         "display_face"
         "display_text"
         "display_engine"
-    REQUIRES esp_driver_gpio esp_driver_i2c esp_lcd esp_timer
+    REQUIRES esp_driver_gpio esp_driver_i2c esp_lcd esp_timer esp_wifi
 )
