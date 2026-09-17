@@ -16,8 +16,9 @@ static const char *TAG = "WS_MGR";
 static constexpr size_t WS_TX_AUDIO_SIZE = 3200;
 static constexpr size_t WS_TX_TEXT_SIZE = 8192;
 static constexpr size_t WS_TX_QUEUE_LENGTH = 3;
-// Match the proven Repo3 realtime-audio transport cadence.
-static constexpr size_t PCM_SEND_CHUNK = 1600;
+// Gemini Live best practice: small realtime chunks. Repo3 uses 512-byte PCM
+// chunks (~32 ms at 16 kHz mono PCM16), so keep the protocol cadence identical.
+static constexpr size_t PCM_SEND_CHUNK = 512;
 static constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
 static constexpr TickType_t AUDIO_SEND_RETRY_DELAY = pdMS_TO_TICKS(30);
 static constexpr int AUDIO_SEND_RETRIES = 1;
