@@ -16,11 +16,13 @@ static const char *TAG = "WS_MGR";
 static constexpr size_t WS_TX_AUDIO_SIZE = 3200;
 static constexpr size_t WS_TX_TEXT_SIZE = 8192;
 static constexpr size_t WS_TX_QUEUE_LENGTH = 3;
-// Keep the websocket critical section short. Repo3 uses 512-byte PCM chunks.
+// Keep individual websocket writes small and give the RX/TLS worker time to run.
+// Repo3 uses 512-byte PCM chunks for the realtime audio path.
 static constexpr size_t PCM_SEND_CHUNK = 512;
-static constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(50);
+static constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(500);
 static constexpr TickType_t AUDIO_SEND_RETRY_DELAY = pdMS_TO_TICKS(20);
-static constexpr int AUDIO_SEND_RETRIES = 5;
+static constexpr TickType_t AUDIO_SEND_PACE_DELAY = pdMS_TO_TICKS(5);
+static constexpr int AUDIO_SEND_RETRIES = 2;
 static constexpr uint32_t TX_TASK_STACK = 8192;
 static constexpr UBaseType_t TX_TASK_PRIORITY = 4;
 
@@ -84,6 +86,9 @@ static void websocket_tx_task(void *)
                 }
                 if (!sent_ok) { failed=true; break; }
                 offset += chunk_len;
+                // Avoid hammering the esp_websocket_client/TLS write path with
+                // a burst of consecutive frames from one 100 ms microphone batch.
+                vTaskDelay(AUDIO_SEND_PACE_DELAY);
             }
             if (failed) tx_fail();
             free(data); continue;
