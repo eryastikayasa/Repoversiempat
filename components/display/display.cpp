@@ -33,11 +33,6 @@ face_state_t face_get_state(void)
     return display_face_get_state();
 }
 
-void face_show_for_ms(face_state_t state, uint32_t duration_ms)
-{
-    display_face_show_for_ms(state, duration_ms);
-}
-
 void display_render_mochi_gaze(int expr, int step, int sX, int sY,
                                int gaze_x, int gaze_y)
 {
