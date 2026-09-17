@@ -1,213 +1,125 @@
 #include "audio_hal.h"
-
-#include "driver/i2s_std.h"
 #include "esp_log.h"
+#include "esp_err.h"
+#include "driver/i2s_std.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
+#include <stdint.h>
+#include <stddef.h>
 
 static const char *TAG = "AUDIO_HAL";
-
-static constexpr gpio_num_t MIC_I2S_SCK = GPIO_NUM_5;
-static constexpr gpio_num_t MIC_I2S_WS  = GPIO_NUM_4;
-static constexpr gpio_num_t MIC_I2S_SD  = GPIO_NUM_6;
-static constexpr gpio_num_t SPK_I2S_BCLK = GPIO_NUM_15;
-static constexpr gpio_num_t SPK_I2S_LRCK = GPIO_NUM_16;
-static constexpr gpio_num_t SPK_I2S_DOUT = GPIO_NUM_7;
-
-static constexpr uint32_t MIC_SAMPLE_RATE = 16000;
-static constexpr uint32_t SPK_SAMPLE_RATE = 24000;
-
-static i2s_chan_handle_t s_rx = nullptr;
-static i2s_chan_handle_t s_tx = nullptr;
-static bool s_initialized = false;
-static bool s_capture_started = false;
-static bool s_playback_started = false;
-
-static int32_t s_rx_raw[1024];
-static int32_t s_tx_raw[512];
+static i2s_chan_handle_t rx_handle = NULL;
+static i2s_chan_handle_t tx_handle = NULL;
 
 void audio_hal_init(void)
 {
-    if (s_initialized) {
-        ESP_LOGW(TAG, "Audio HAL sudah diinisialisasi");
-        return;
-    }
-
-    ESP_LOGI(TAG, "Audio HAL init: MIC=16k PCM16, SPK=24k PCM16");
-
+    ESP_LOGI(TAG, "Menginisialisasi Audio I2S - proven v6.1.5 / Xiaozhi-compatible...");
     i2s_chan_config_t tx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_0, I2S_ROLE_MASTER);
-    tx_chan_cfg.dma_desc_num = 6;
-    tx_chan_cfg.dma_frame_num = 240;
-    tx_chan_cfg.auto_clear = true;
-    ESP_ERROR_CHECK(i2s_new_channel(&tx_chan_cfg, &s_tx, nullptr));
-
+    tx_chan_cfg.dma_desc_num = 6; tx_chan_cfg.dma_frame_num = 240; tx_chan_cfg.auto_clear = true;
+    ESP_ERROR_CHECK(i2s_new_channel(&tx_chan_cfg, &tx_handle, nullptr));
     i2s_chan_config_t rx_chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM_1, I2S_ROLE_MASTER);
-    rx_chan_cfg.dma_desc_num = 6;
-    rx_chan_cfg.dma_frame_num = 240;
-    rx_chan_cfg.auto_clear = true;
-    ESP_ERROR_CHECK(i2s_new_channel(&rx_chan_cfg, nullptr, &s_rx));
+    rx_chan_cfg.dma_desc_num = 6; rx_chan_cfg.dma_frame_num = 240; rx_chan_cfg.auto_clear = true;
+    ESP_ERROR_CHECK(i2s_new_channel(&rx_chan_cfg, nullptr, &rx_handle));
 
     i2s_std_config_t rx_cfg = {};
     rx_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(MIC_SAMPLE_RATE);
-    rx_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-        I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
+    rx_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
     rx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
-    rx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-    rx_cfg.gpio_cfg.bclk = MIC_I2S_SCK;
-    rx_cfg.gpio_cfg.ws = MIC_I2S_WS;
-    rx_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED;
-    rx_cfg.gpio_cfg.din = MIC_I2S_SD;
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_rx, &rx_cfg));
+    rx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED; rx_cfg.gpio_cfg.bclk = MIC_I2S_SCK; rx_cfg.gpio_cfg.ws = MIC_I2S_WS;
+    rx_cfg.gpio_cfg.dout = I2S_GPIO_UNUSED; rx_cfg.gpio_cfg.din = MIC_I2S_SD;
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(rx_handle, &rx_cfg));
 
+    // Keep the proven v6.1.5 MAX98357A format: 32-bit I2S slots, LEFT, Philips.
+    // Gemini audio remains PCM16/24k; conversion happens only at the I2S boundary.
     i2s_std_config_t tx_cfg = {};
     tx_cfg.clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SPK_SAMPLE_RATE);
-    tx_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(
-        I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
+    tx_cfg.slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_MONO);
     tx_cfg.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_AUTO;
     tx_cfg.slot_cfg.slot_mask = I2S_STD_SLOT_LEFT;
     tx_cfg.slot_cfg.ws_width = I2S_DATA_BIT_WIDTH_32BIT;
     tx_cfg.slot_cfg.ws_pol = false;
     tx_cfg.slot_cfg.bit_shift = true;
-    tx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED;
-    tx_cfg.gpio_cfg.bclk = SPK_I2S_BCLK;
-    tx_cfg.gpio_cfg.ws = SPK_I2S_LRCK;
-    tx_cfg.gpio_cfg.dout = SPK_I2S_DOUT;
-    tx_cfg.gpio_cfg.din = I2S_GPIO_UNUSED;
-    ESP_ERROR_CHECK(i2s_channel_init_std_mode(s_tx, &tx_cfg));
-
-    s_initialized = true;
-    ESP_LOGI(TAG, "Audio HAL hardware siap; I2S RX/TX belum dimulai");
+    tx_cfg.gpio_cfg.mclk = I2S_GPIO_UNUSED; tx_cfg.gpio_cfg.bclk = SPK_I2S_BCLK; tx_cfg.gpio_cfg.ws = SPK_I2S_LRCK;
+    tx_cfg.gpio_cfg.dout = SPK_I2S_DOUT; tx_cfg.gpio_cfg.din = I2S_GPIO_UNUSED;
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
+    ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
+    ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT", MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
 }
 
-esp_err_t audio_hal_start_capture(void)
+size_t audio_read_mic(uint8_t *dest, size_t max_len)
 {
-    if (!s_initialized || !s_rx) return ESP_ERR_INVALID_STATE;
-    if (s_capture_started) return ESP_OK;
-    esp_err_t err = i2s_channel_enable(s_rx);
-    if (err == ESP_OK) {
-        s_capture_started = true;
-        ESP_LOGI(TAG, "MIC capture START");
-    }
-    return err;
-}
-
-esp_err_t audio_hal_stop_capture(void)
-{
-    if (!s_initialized || !s_rx) return ESP_ERR_INVALID_STATE;
-    if (!s_capture_started) return ESP_OK;
-
-    // Keep the RX peripheral enabled across WakeWord -> Gemini ownership handoff.
-    // Only the reader task changes; stopping the I2S channel here can leave the
-    // next Gemini reader waiting on a disabled RX channel and create a false
-    // capture timeout during conversation startup.
-    ESP_LOGI(TAG, "MIC capture ownership released; I2S RX remains enabled");
-    return ESP_OK;
-}
-
-esp_err_t audio_hal_read_pcm(int16_t *buffer, size_t samples, size_t *samples_read)
-{
-    if (samples_read) *samples_read = 0;
-    if (!buffer || samples == 0 || !samples_read) return ESP_ERR_INVALID_ARG;
-    if (!s_capture_started || !s_rx) return ESP_ERR_INVALID_STATE;
-    if (samples > 1024) return ESP_ERR_INVALID_SIZE;
-
+    if (!rx_handle || !dest || max_len < sizeof(int16_t)) return 0;
+    static int32_t raw[512];
+    size_t max_samples = max_len / sizeof(int16_t); if (max_samples > 512) max_samples = 512;
     size_t bytes_read = 0;
-    const size_t input_bytes = samples * sizeof(int32_t);
-    esp_err_t err = i2s_channel_read(s_rx, s_rx_raw, input_bytes, &bytes_read, pdMS_TO_TICKS(100));
-    if (err != ESP_OK) return err;
-
-    const size_t count = bytes_read / sizeof(int32_t);
-    for (size_t i = 0; i < count; ++i) {
-        buffer[i] = (int16_t)(s_rx_raw[i] >> 16);
-    }
-    *samples_read = count;
-    return ESP_OK;
+    if (i2s_channel_read(rx_handle, raw, max_samples * sizeof(int32_t), &bytes_read, portMAX_DELAY) != ESP_OK) return 0;
+    size_t samples = bytes_read / sizeof(int32_t); int16_t *pcm = reinterpret_cast<int16_t *>(dest);
+    for (size_t i = 0; i < samples; ++i) pcm[i] = static_cast<int16_t>(raw[i] >> 16);
+    return samples * sizeof(int16_t);
 }
 
-esp_err_t audio_hal_start_playback(void)
+void audio_write_speaker(const uint8_t *src, size_t len)
 {
-    if (!s_initialized || !s_tx) return ESP_ERR_INVALID_STATE;
-    if (s_playback_started) return ESP_OK;
-    esp_err_t err = i2s_channel_enable(s_tx);
-    if (err == ESP_OK) {
-        s_playback_started = true;
-        ESP_LOGI(TAG, "SPK playback START");
-    }
-    return err;
-}
+    if (!tx_handle || !src || len < 2) return;
+    len &= ~((size_t)1);
+    static int32_t tx_buffer[1024];
+    const int16_t *pcm = reinterpret_cast<const int16_t *>(src);
+    size_t total = len / sizeof(int16_t), offset = 0;
 
-esp_err_t audio_hal_stop_playback(void)
-{
-    if (!s_initialized || !s_tx) return ESP_ERR_INVALID_STATE;
-    if (!s_playback_started) return ESP_OK;
-    esp_err_t err = i2s_channel_disable(s_tx);
-    if (err == ESP_OK) {
-        s_playback_started = false;
-        ESP_LOGI(TAG, "SPK playback STOP");
-    }
-    return err;
-}
-
-esp_err_t audio_hal_write_pcm(const int16_t *buffer, size_t samples, size_t *samples_written)
-{
-    if (samples_written) *samples_written = 0;
-    if (!buffer || samples == 0 || !samples_written) return ESP_ERR_INVALID_ARG;
-    if (!s_playback_started || !s_tx) return ESP_ERR_INVALID_STATE;
-    if (samples > 1024) return ESP_ERR_INVALID_SIZE;
-
+    /*
+     * v7.0.34: keep the bounded I2S write from v7.0.33, but also yield after
+     * every successful DMA chunk. v7.0.33 only yielded when I2S stalled; a
+     * stream of successful 512-sample writes could still keep audio_playback
+     * runnable on CPU1 long enough to starve IDLE1 and trigger Task WDT.
+     *
+     * ESP-IDF 6.x uses a millisecond timeout for i2s_channel_write().
+     * Do not pass portMAX_DELAY here: that value is an RTOS tick sentinel,
+     * not an I2S timeout in milliseconds. Bound each DMA wait so a stalled
+     * speaker path cannot monopolize CPU1 and starve IDLE1/WDT.
+     *
+     * 512 PCM samples = 21.3 ms of 24 kHz audio in the 32-bit I2S path.
+     * The explicit scheduler yield below gives other CPU1 tasks a chance
+     * between chunks without changing the I2S format or DMA configuration.
+     */
     constexpr size_t I2S_WRITE_SAMPLES = 512;
     constexpr uint32_t I2S_WRITE_TIMEOUT_MS = 50;
-    constexpr uint32_t MAX_NO_PROGRESS_RETRIES = 5;
 
-    size_t total_written = 0;
-    uint32_t no_progress_retries = 0;
+    while (offset < total) {
+        size_t n = total - offset; if (n > I2S_WRITE_SAMPLES) n = I2S_WRITE_SAMPLES;
+        for (size_t i = 0; i < n; ++i) tx_buffer[i] = static_cast<int32_t>(pcm[offset + i]) << 16;
 
-    while (total_written < samples) {
-        const size_t n = (samples - total_written > I2S_WRITE_SAMPLES)
-                       ? I2S_WRITE_SAMPLES
-                       : (samples - total_written);
+        size_t written = 0;
+        esp_err_t err = i2s_channel_write(tx_handle, tx_buffer, n * sizeof(int32_t), &written, I2S_WRITE_TIMEOUT_MS);
+        size_t samples_written = written / sizeof(int32_t);
+        if (samples_written > n) samples_written = n;
+        offset += samples_written;
 
-        for (size_t i = 0; i < n; ++i) {
-            s_tx_raw[i] = static_cast<int32_t>(buffer[total_written + i]) << 16;
-        }
-
-        size_t bytes_written = 0;
-        const esp_err_t err = i2s_channel_write(
-            s_tx,
-            s_tx_raw,
-            n * sizeof(int32_t),
-            &bytes_written,
-            I2S_WRITE_TIMEOUT_MS);
-
-        size_t written = bytes_written / sizeof(int32_t);
-        if (written > n) written = n;
-        total_written += written;
-
-        if (written > 0) {
-            no_progress_retries = 0;
+        if (err != ESP_OK || samples_written == 0) {
+            ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums",
+                     esp_err_to_name(err), (unsigned)written,
+                     (unsigned)(n * sizeof(int32_t)), (unsigned)I2S_WRITE_TIMEOUT_MS);
+            /* Give CPU1's lower-priority idle task a real scheduling window
+             * before returning from a stalled DMA path. */
             vTaskDelay(1);
-            continue;
+            return;
         }
 
-        if (err == ESP_OK) {
-            ESP_LOGW(TAG, "I2S speaker write made no progress; retrying");
-        } else {
-            ESP_LOGW(TAG,
-                     "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums",
-                     esp_err_to_name(err),
-                     (unsigned)bytes_written,
-                     (unsigned)(n * sizeof(int32_t)),
-                     (unsigned)I2S_WRITE_TIMEOUT_MS);
-        }
-
-        if (++no_progress_retries >= MAX_NO_PROGRESS_RETRIES) {
-            *samples_written = total_written;
-            vTaskDelay(1);
-            return err != ESP_OK ? err : ESP_ERR_TIMEOUT;
-        }
+        /*
+         * v7.0.34 scheduler yield:
+         * Never let a long sequence of successful audio writes monopolize
+         * CPU1. This is a scheduling change only; I2S timing/format remains
+         * exactly the v6.1.5 locked baseline.
+         */
         vTaskDelay(1);
     }
+}
 
-    *samples_written = total_written;
-    return ESP_OK;
+void audio_i2s_test_tone(void)
+{
+    static const int16_t sine_table[24] = {0,2071,4000,5657,6928,7727,8000,7727,6928,5657,4000,2071,0,-2071,-4000,-5657,-6928,-7727,-8000,-7727,-6928,-5657,-4000,-2071};
+    static int16_t tone[2400];
+    if (!tx_handle) return;
+    for (size_t i = 0; i < 2400; ++i) tone[i] = sine_table[i % 24];
+    ESP_LOGI(TAG, "I2S TEST TONE: 1kHz PCM16 -> PCM32 I2S, 24kHz, 100ms");
+    audio_write_speaker(reinterpret_cast<const uint8_t *>(tone), sizeof(tone));
 }
