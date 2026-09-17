@@ -9,6 +9,7 @@
 static const char *TAG = "AUDIO_HAL";
 static i2s_chan_handle_t rx_handle = NULL;
 static i2s_chan_handle_t tx_handle = NULL;
+static bool rx_enabled = false;
 
 void audio_hal_init(void)
 {
@@ -43,12 +44,68 @@ void audio_hal_init(void)
     ESP_ERROR_CHECK(i2s_channel_init_std_mode(tx_handle, &tx_cfg));
     ESP_ERROR_CHECK(i2s_channel_enable(rx_handle));
     ESP_ERROR_CHECK(i2s_channel_enable(tx_handle));
+    rx_enabled = true;
     ESP_LOGI(TAG, "Audio siap. MIC=%d Hz 32-bit LEFT -> PCM16, SPEAKER=%d Hz 32-bit LEFT", MIC_SAMPLE_RATE, SPK_SAMPLE_RATE);
+}
+
+esp_err_t audio_hal_start_capture(void)
+{
+    if (!rx_handle) return ESP_ERR_INVALID_STATE;
+    if (rx_enabled) return ESP_OK;
+    const esp_err_t err = i2s_channel_enable(rx_handle);
+    if (err == ESP_OK) {
+        rx_enabled = true;
+        ESP_LOGI(TAG, "MIC capture START");
+    }
+    return err;
+}
+
+esp_err_t audio_hal_stop_capture(void)
+{
+    if (!rx_handle) return ESP_ERR_INVALID_STATE;
+    if (!rx_enabled) return ESP_OK;
+    const esp_err_t err = i2s_channel_disable(rx_handle);
+    if (err == ESP_OK) {
+        rx_enabled = false;
+        ESP_LOGI(TAG, "MIC capture STOP");
+    }
+    return err;
+}
+
+esp_err_t audio_hal_read_pcm(int16_t *buffer, size_t samples, size_t *samples_read)
+{
+    if (samples_read) *samples_read = 0;
+    if (!buffer || samples == 0 || !samples_read) return ESP_ERR_INVALID_ARG;
+    if (!rx_handle) return ESP_ERR_INVALID_STATE;
+    if (samples > 512) return ESP_ERR_INVALID_SIZE;
+
+    if (!rx_enabled) {
+        const esp_err_t start_err = audio_hal_start_capture();
+        if (start_err != ESP_OK) return start_err;
+    }
+
+    static int32_t raw[512];
+    size_t bytes_read = 0;
+    const esp_err_t err = i2s_channel_read(
+        rx_handle,
+        raw,
+        samples * sizeof(int32_t),
+        &bytes_read,
+        portMAX_DELAY);
+    if (err != ESP_OK) return err;
+
+    const size_t count = bytes_read / sizeof(int32_t);
+    for (size_t i = 0; i < count; ++i) {
+        buffer[i] = static_cast<int16_t>(raw[i] >> 16);
+    }
+    *samples_read = count;
+    return ESP_OK;
 }
 
 size_t audio_read_mic(uint8_t *dest, size_t max_len)
 {
     if (!rx_handle || !dest || max_len < sizeof(int16_t)) return 0;
+    if (!rx_enabled && audio_hal_start_capture() != ESP_OK) return 0;
     static int32_t raw[512];
     size_t max_samples = max_len / sizeof(int16_t); if (max_samples > 512) max_samples = 512;
     size_t bytes_read = 0;
@@ -98,18 +155,10 @@ void audio_write_speaker(const uint8_t *src, size_t len)
             ESP_LOGW(TAG, "I2S speaker write timeout/fail: err=%s written=%u/%u timeout=%ums",
                      esp_err_to_name(err), (unsigned)written,
                      (unsigned)(n * sizeof(int32_t)), (unsigned)I2S_WRITE_TIMEOUT_MS);
-            /* Give CPU1's lower-priority idle task a real scheduling window
-             * before returning from a stalled DMA path. */
             vTaskDelay(1);
             return;
         }
 
-        /*
-         * v7.0.34 scheduler yield:
-         * Never let a long sequence of successful audio writes monopolize
-         * CPU1. This is a scheduling change only; I2S timing/format remains
-         * exactly the v6.1.5 locked baseline.
-         */
         vTaskDelay(1);
     }
 }
