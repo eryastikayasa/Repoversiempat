@@ -18,6 +18,7 @@
 
 static const char *TAG = "MAIN";
 static constexpr gpio_num_t BOOT_BUTTON_GPIO = GPIO_NUM_0;
+static bool s_conversation_starting = false;
 
 static bool init_nvs(void)
 {
@@ -81,6 +82,7 @@ static bool init_websocket(void)
 static bool restart_wakeword_after_conversation_failure(void)
 {
     websocket_disconnect();
+    audio_engine_stop_conversation();
     if (!audio_engine_start_wakeword()) {
         display_face_set_state(FACE_ERROR);
         display_text_set_status("WakeWord gagal");
@@ -88,18 +90,35 @@ static bool restart_wakeword_after_conversation_failure(void)
     }
     display_face_set_state(FACE_IDLE);
     display_text_set_status("Siap - ucap HI ESP");
+    ESP_LOGI(TAG, "MODE: WAKEWORD ON - kembali menunggu HI ESP");
     return true;
 }
 
 static bool start_conversation(void)
 {
+    if (s_conversation_starting || audio_engine_conversation_active()) return false;
+    s_conversation_starting = true;
+
     display_face_set_state(FACE_LISTENING);
+    display_text_set_status("WakeWord OFF...");
+
+    // Exclusive MIC ownership: WakeWord MUST stop and release MIC first.
+    audio_engine_clear_wakeword();
+    audio_engine_stop_wakeword();
+    if (audio_engine_conversation_active()) {
+        ESP_LOGE(TAG, "Invariant gagal: conversation MIC aktif saat transisi");
+        s_conversation_starting = false;
+        return false;
+    }
+
+    ESP_LOGI(TAG, "MODE TRANSITION: WAKEWORD STOP -> MIC RELEASED");
     display_text_set_status("Menghubungkan Gemini...");
 
     const esp_err_t ws_err = websocket_connect();
     if (ws_err != ESP_OK) {
         display_face_set_state(FACE_ERROR);
         display_text_set_status("Gemini gagal");
+        s_conversation_starting = false;
         restart_wakeword_after_conversation_failure();
         return false;
     }
@@ -109,16 +128,21 @@ static bool start_conversation(void)
         if ((int32_t)(xTaskGetTickCount() - deadline) >= 0) {
             display_face_set_state(FACE_ERROR);
             display_text_set_status("Gemini timeout");
+            s_conversation_starting = false;
             restart_wakeword_after_conversation_failure();
             return false;
         }
         vTaskDelay(pdMS_TO_TICKS(20));
     }
 
+    ESP_LOGI(TAG, "MODE: GEMINI setupComplete / READY");
     display_text_set_status("Mendengarkan...");
+
+    // Gemini owns the MIC only after setupComplete.
     if (!audio_engine_start_conversation()) {
         display_face_set_state(FACE_ERROR);
         display_text_set_status("Audio gagal");
+        s_conversation_starting = false;
         restart_wakeword_after_conversation_failure();
         return false;
     }
@@ -127,11 +151,13 @@ static bool start_conversation(void)
         audio_engine_stop_conversation();
         display_face_set_state(FACE_ERROR);
         display_text_set_status("Uplink gagal");
+        s_conversation_starting = false;
         restart_wakeword_after_conversation_failure();
         return false;
     }
 
-    ESP_LOGI(TAG, "CONVERSATION START: AudioEngine -> WebSocket -> Gemini");
+    s_conversation_starting = false;
+    ESP_LOGI(TAG, "MODE: GEMINI ACTIVE - MIC owner=GEMINI");
     return true;
 }
 
@@ -197,7 +223,8 @@ extern "C" void app_main(void)
             boot_button_down = false;
         }
 
-        if (audio_engine_wakeword_detected()) {
+        if (!s_conversation_starting && !audio_engine_conversation_active() &&
+            audio_engine_wakeword_detected()) {
             ESP_LOGI(TAG, "MAIN: WakeWord event");
             audio_engine_clear_wakeword();
             if (start_conversation()) ESP_LOGI(TAG, "MAIN: conversation mode ACTIVE (WakeWord)");
