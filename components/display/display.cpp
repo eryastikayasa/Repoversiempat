@@ -1,7 +1,6 @@
 #include "display.h"
 #include "display_driver.h"
 #include "display_face.h"
-#include "display_text.h"
 #include "display_engine.h"
 
 void oled_init(void)
@@ -19,12 +18,12 @@ void display_render_buffer(const uint8_t *buffer)
 
 void display_status(const char *text)
 {
-    display_text_set_status(text ? text : "");
+    display_set_status(text);
 }
 
 void face_set_state(face_state_t state)
 {
-    display_face_set_state(state);
+    display_set_face_state(state);
 }
 
 face_state_t face_get_state(void)
