@@ -13,8 +13,8 @@ static constexpr size_t FRAME_SAMPLES = 320;
 static constexpr size_t FRAME_BYTES = FRAME_SAMPLES * sizeof(int16_t);
 static constexpr size_t FRAMES_PER_BUFFER = 5;
 static constexpr size_t TX_BUFFER_BYTES = FRAME_BYTES * FRAMES_PER_BUFFER;
-static constexpr uint32_t TASK_STACK = 6144;
-static constexpr UBaseType_t TASK_PRIORITY = 5;
+static constexpr uint32_t TASK_STACK = 8192;
+static constexpr UBaseType_t TASK_PRIORITY = 6;
 static constexpr int32_t SILENCE_THRESHOLD = 500;
 static constexpr size_t MIN_ACTIVE_SAMPLES = 8;
 
