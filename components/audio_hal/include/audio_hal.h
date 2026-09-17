@@ -2,6 +2,7 @@
 
 #include "driver/gpio.h"
 #include "driver/i2s_std.h"
+#include "esp_err.h"
 #include <stddef.h>
 #include <stdint.h>
 
@@ -27,8 +28,11 @@
 
 #define AUDIO_BITS 16
 
-
 void audio_hal_init(void);
+
+esp_err_t audio_hal_start_capture(void);
+esp_err_t audio_hal_stop_capture(void);
+esp_err_t audio_hal_read_pcm(int16_t *buffer, size_t samples, size_t *samples_read);
 
 void audio_i2s_test_tone(void);
 
