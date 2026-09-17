@@ -78,8 +78,18 @@ void display_engine_stop(void)
     s_running = false;
 }
 
-void display_set_system_state(face_state_t face, const char *status)
+void display_set_face_state(face_state_t face)
 {
     display_face_set_state(face);
+}
+
+void display_set_status(const char *status)
+{
     display_text_set_status(status ? status : "");
+}
+
+void display_set_system_state(face_state_t face, const char *status)
+{
+    display_set_face_state(face);
+    display_set_status(status);
 }
