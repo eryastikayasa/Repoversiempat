@@ -301,6 +301,7 @@ extern "C" void app_main()
     ESP_ERROR_CHECK(ret);
 
     if (web_config_is_needed()) {
+        oled_init();
         display_status("Config Mode");
         web_config_start();
         while (1) vTaskDelay(pdMS_TO_TICKS(1000));
