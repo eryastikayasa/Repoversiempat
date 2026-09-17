@@ -44,29 +44,31 @@ jobs:
           grep -E '^CONFIG_SPIRAM_MODE_OCT=y$' sdkconfig.defaults
           grep -E '^CONFIG_SPIRAM_SPEED_80M=y$' sdkconfig.defaults
           echo "--- source integration ---"
-          grep -n 'WAKE_MODEL_NAME "wn9_hiesp"' main/main.cpp
-          grep -n 'static bool wakeword_init' main/main.cpp
-          grep -n 'esp_srmodel_init("model")' main/main.cpp
-          grep -n 'esp_srmodel_exists' main/main.cpp
-          grep -n 'esp_wn_handle_from_name(WAKE_MODEL_NAME)' main/main.cpp
-          grep -n 'wake_iface->create(WAKE_MODEL_NAME, DET_MODE_90)' main/main.cpp
-          grep -n 'wake_iface->detect(wake_model, wake_pcm)' main/main.cpp
-          grep -n 'WAKE WORD TERDETEKSI: HI, ESP' main/main.cpp
+          WAKE_SRC=components/wakeword/wakeword.cpp
+          test -f "$WAKE_SRC"
+          grep -n 'MODEL_NAME\[\] = "wn9_hiesp"' "$WAKE_SRC"
+          grep -n 'esp_srmodel_init("model")' "$WAKE_SRC"
+          grep -n 'esp_srmodel_exists' "$WAKE_SRC"
+          grep -n 'esp_wn_handle_from_name(MODEL_NAME)' "$WAKE_SRC"
+          grep -n 's_iface->create(MODEL_NAME, DET_MODE_90)' "$WAKE_SRC"
+          grep -n 'get_samp_chunksize' "$WAKE_SRC"
+          grep -n 's_iface->detect(s_model, s_buffer)' "$WAKE_SRC"
+          grep -n 'detected HI, ESP' "$WAKE_SRC"
+          grep -n 'audio_hal_read_pcm' "$WAKE_SRC"
+          grep -n 'xTaskCreate' "$WAKE_SRC"
           echo "--- model partition ---"
           grep -E '^model,.*0x400000' partitions/partitions.csv
           if [ -f artifacts/firmware.elf ]; then
             ELF=artifacts/firmware.elf
             echo "--- compiled ELF strings ---"
-            strings "$ELF" | grep -F 'ESP-SR WAKE WORD INIT'
-            strings "$ELF" | grep -F 'WakeNet ready:'
-            strings "$ELF" | grep -F 'Wake word aktif: HI, ESP'
-            strings "$ELF" | grep -F 'WAKE WORD TERDETEKSI: HI, ESP'
             strings "$ELF" | grep -F 'wn9_hiesp'
+            strings "$ELF" | grep -F 'WakeNet ready: HI, ESP / DET_MODE_90'
+            strings "$ELF" | grep -F 'detected HI, ESP (id='
             echo "Compiled WakeNet9 integration: PASS"
           else
             echo "No firmware artifact in manual audit; source/config checks passed."
           fi
           echo "========================================"
           echo "WAKENET9 HI ESP AUDIT: PASS"
-          echo "Config + model + runtime integration verified"
+          echo "Config + dedicated WakeWord runtime integration verified"
           echo "========================================"
