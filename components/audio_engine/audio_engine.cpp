@@ -119,7 +119,10 @@ static void conversation_task(void *)
 
 static bool stop_wakeword_and_wait(void)
 {
-    if (!s_wakeword_running && s_wakeword_task == nullptr) return true;
+    if (!s_wakeword_running && s_wakeword_task == nullptr) {
+        (void)audio_hal_stop_capture();
+        return true;
+    }
 
     s_wakeword_running = false;
     (void)audio_hal_stop_capture();
@@ -133,6 +136,8 @@ static bool stop_wakeword_and_wait(void)
         return false;
     }
 
+    s_wakeword_detected = false;
+    ESP_LOGI(TAG, "MODE: WAKEWORD OFF -> MIC RELEASED");
     return true;
 }
 
@@ -211,16 +216,13 @@ extern "C" bool audio_engine_start_wakeword(void)
         return false;
     }
 
-    ESP_LOGI(TAG, "WakeWord capture START");
+    ESP_LOGI(TAG, "MODE: WAKEWORD ON - MIC OWNER=WAKEWORD");
     return true;
 }
 
 extern "C" void audio_engine_stop_wakeword(void)
 {
-    if (!s_wakeword_running && s_wakeword_task == nullptr) return;
-    s_wakeword_running = false;
-    (void)audio_hal_stop_capture();
-    ESP_LOGI(TAG, "WakeWord capture STOP");
+    (void)stop_wakeword_and_wait();
 }
 
 extern "C" bool audio_engine_process_wakeword(void)
@@ -269,7 +271,9 @@ extern "C" bool audio_engine_start_conversation(void)
     }
     if (s_conversation_running) return true;
 
-    if (!stop_wakeword_and_wait()) return false;
+    if (s_wakeword_running || s_wakeword_task != nullptr) {
+        if (!stop_wakeword_and_wait()) return false;
+    }
 
     if (audio_hal_start_capture() != ESP_OK) {
         ESP_LOGE(TAG, "Gagal start MIC capture untuk conversation");
@@ -295,7 +299,7 @@ extern "C" bool audio_engine_start_conversation(void)
         return false;
     }
 
-    ESP_LOGI(TAG, "Conversation audio START: AudioEngine owns MIC");
+    ESP_LOGI(TAG, "MODE: GEMINI MIC ON - MIC OWNER=GEMINI");
     return true;
 }
 
@@ -311,7 +315,7 @@ extern "C" void audio_engine_stop_conversation(void)
     }
 
     xQueueReset(s_mic_queue);
-    ESP_LOGI(TAG, "Conversation audio STOP: MIC released");
+    ESP_LOGI(TAG, "MODE: GEMINI MIC OFF -> MIC RELEASED");
 }
 
 extern "C" bool audio_engine_conversation_active(void)
