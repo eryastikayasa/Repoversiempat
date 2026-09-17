@@ -16,13 +16,11 @@ static const char *TAG = "WS_MGR";
 static constexpr size_t WS_TX_AUDIO_SIZE = 3200;
 static constexpr size_t WS_TX_TEXT_SIZE = 8192;
 static constexpr size_t WS_TX_QUEUE_LENGTH = 3;
-// Keep individual websocket writes small and give the RX/TLS worker time to run.
-// Repo3 uses 512-byte PCM chunks for the realtime audio path.
-static constexpr size_t PCM_SEND_CHUNK = 512;
-static constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(500);
-static constexpr TickType_t AUDIO_SEND_RETRY_DELAY = pdMS_TO_TICKS(20);
-static constexpr TickType_t AUDIO_SEND_PACE_DELAY = pdMS_TO_TICKS(5);
-static constexpr int AUDIO_SEND_RETRIES = 2;
+// Match the proven Repo3 realtime-audio transport cadence.
+static constexpr size_t PCM_SEND_CHUNK = 1600;
+static constexpr TickType_t AUDIO_SEND_TIMEOUT = pdMS_TO_TICKS(3000);
+static constexpr TickType_t AUDIO_SEND_RETRY_DELAY = pdMS_TO_TICKS(30);
+static constexpr int AUDIO_SEND_RETRIES = 1;
 static constexpr uint32_t TX_TASK_STACK = 8192;
 static constexpr UBaseType_t TX_TASK_PRIORITY = 4;
 
@@ -47,8 +45,8 @@ static bool send_text_checked(esp_websocket_client_handle_t ws, const char *text
 static void websocket_tx_task(void *)
 {
     ws_tx_command_t cmd{};
-    static char b64_buf[1024];
-    static char json_buf[1400];
+    static char b64_buf[2300];
+    static char json_buf[2500];
     for (;;) {
         if (xQueueReceive(s_tx_queue, &cmd, portMAX_DELAY) != pdTRUE) continue;
         uint8_t *data = cmd.data; cmd.data = nullptr;
@@ -86,9 +84,6 @@ static void websocket_tx_task(void *)
                 }
                 if (!sent_ok) { failed=true; break; }
                 offset += chunk_len;
-                // Avoid hammering the esp_websocket_client/TLS write path with
-                // a burst of consecutive frames from one 100 ms microphone batch.
-                vTaskDelay(AUDIO_SEND_PACE_DELAY);
             }
             if (failed) tx_fail();
             free(data); continue;
@@ -116,7 +111,7 @@ esp_err_t websocket_init(void) { const esp_err_t err=websocket_transport_init();
 esp_err_t websocket_connect(void) { return ensure_tx_worker()?websocket_transport_connect():ESP_FAIL; }
 esp_err_t websocket_disconnect(void) { s_tx_error=true; s_generation++; tx_flush_queue(); return websocket_transport_disconnect(); }
 bool websocket_is_connected(void) { return !s_tx_error && websocket_transport_is_connected() && websocket_event_gemini_ready(); }
-esp_err_t websocket_send_text(const char *text,size_t len) { if(!text||len==0||len>WS_TX_TEXT_SIZE||!websocket_transport_is_connected())return ESP_ERR_INVALID_ARG; char *copy=(char*)malloc(len); if(!copy)return ESP_ERR_NO_MEM; memcpy(copy,text,len); ws_tx_command_t cmd{}; cmd.type=WS_TX_COMMAND_TEXT;cmd.generation=s_generation;cmd.len=(uint16_t)len;cmd.data=(uint8_t*)copy;return enqueue_command(&cmd)?ESP_OK:ESP_FAIL; }
+esp_err_t websocket_send_text(const char *text,size_t len) { if(!text||len==0||len>WS_TX_TEXT_SIZE||!websocket_transport_is_connected())return ESP_ERR_INVALID_ARG; char *copy=(char*)malloc(len); if(!copy)return ESP_ERR_NO_MEM; memcpy(copy,text,len); ws_tx_command_t cmd{};cmd.type=WS_TX_COMMAND_TEXT;cmd.generation=s_generation;cmd.len=(uint16_t)len;cmd.data=(uint8_t*)copy;return enqueue_command(&cmd)?ESP_OK:ESP_FAIL; }
 esp_err_t websocket_send_binary(const uint8_t *data,size_t len){(void)data;(void)len;return ESP_ERR_NOT_SUPPORTED;}
 bool websocket_tx_enqueue_audio(const uint8_t *data,size_t len){if(!data||len==0||len>WS_TX_AUDIO_SIZE||!websocket_is_connected())return false;uint8_t*copy=(uint8_t*)malloc(len);if(!copy)return false;memcpy(copy,data,len);ws_tx_command_t cmd{};cmd.type=WS_TX_COMMAND_AUDIO;cmd.generation=s_generation;cmd.len=(uint16_t)len;cmd.data=copy;return enqueue_command(&cmd);}
 void websocket_tx_schedule_setup(void){if(!ensure_tx_worker()||!websocket_transport_is_connected()||s_tx_error)return;ws_tx_command_t cmd{};cmd.type=WS_TX_COMMAND_SETUP;cmd.generation=s_generation;(void)enqueue_command(&cmd);}
