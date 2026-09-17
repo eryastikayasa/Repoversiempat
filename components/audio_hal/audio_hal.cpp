@@ -95,12 +95,13 @@ esp_err_t audio_hal_stop_capture(void)
 {
     if (!s_initialized || !s_rx) return ESP_ERR_INVALID_STATE;
     if (!s_capture_started) return ESP_OK;
-    esp_err_t err = i2s_channel_disable(s_rx);
-    if (err == ESP_OK) {
-        s_capture_started = false;
-        ESP_LOGI(TAG, "MIC capture STOP");
-    }
-    return err;
+
+    // Keep the RX peripheral enabled across WakeWord -> Gemini ownership handoff.
+    // Only the reader task changes; stopping the I2S channel here can leave the
+    // next Gemini reader waiting on a disabled RX channel and create a false
+    // capture timeout during conversation startup.
+    ESP_LOGI(TAG, "MIC capture ownership released; I2S RX remains enabled");
+    return ESP_OK;
 }
 
 esp_err_t audio_hal_read_pcm(int16_t *buffer, size_t samples, size_t *samples_read)
