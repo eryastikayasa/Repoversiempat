@@ -19,7 +19,7 @@ static constexpr uint32_t WAKEWORD_TASK_STACK = 8192;
 static constexpr size_t MIC_FRAME_SAMPLES = 320;
 static constexpr size_t MIC_FRAME_BYTES = MIC_FRAME_SAMPLES * sizeof(int16_t);
 static constexpr size_t MIC_QUEUE_DEPTH = 8;
-static constexpr uint32_t CONVERSATION_TASK_STACK = 4096;
+static constexpr uint32_t CONVERSATION_TASK_STACK = 8192;
 
 static int16_t s_pcm_buffer[PCM_BLOCK_SAMPLES];
 static TaskHandle_t s_wakeword_task = nullptr;
