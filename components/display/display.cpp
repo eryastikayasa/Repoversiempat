@@ -1,29 +1,30 @@
 #include "display.h"
 #include "display_driver.h"
 #include "display_face.h"
+#include "display_text.h"
 #include "display_engine.h"
 
 void oled_init(void)
 {
+    display_face_init();
+    display_text_init();
     display_engine_init();
     display_engine_start();
 }
 
 void display_render_buffer(const uint8_t *buffer)
 {
-    // Legacy API retained for compatibility. The display engine owns the final
-    // OLED presentation; callers may not bypass the compositor anymore.
     (void)buffer;
 }
 
 void display_status(const char *text)
 {
-    display_set_status(text);
+    display_text_set_status(text ? text : "");
 }
 
 void face_set_state(face_state_t state)
 {
-    display_set_face_state(state);
+    display_face_set_state(state);
 }
 
 face_state_t face_get_state(void)
